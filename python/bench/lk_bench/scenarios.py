@@ -49,7 +49,7 @@ def registry():
         "b4": sc_fresh.b4_late_pos, "b5": sc_ops.b5_duplicates_crash, "b6": sc_ops.b6_rule_change, "b7": sc_ops.b7_drift,
         "b8": sc_ops.b8_report, "b9": sc_cost.b9_cost, "b10": sc_cost.b10_extrapolation,
         "atomic": sc_proofs.atomic_swap, "determinism": sc_proofs.replay_determinism,
-        "batch": sc_ops.corrective_batch, "master-stats": sc_ops.master_stats,
+        "e2e": sc_ops.e2e, "batch": sc_ops.corrective_batch, "master-stats": sc_ops.master_stats,
     }
 
 

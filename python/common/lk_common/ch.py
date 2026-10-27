@@ -28,6 +28,13 @@ class ClickHouse:
         if r.status_code != 200:
             raise RuntimeError(f"ClickHouse {r.status_code}: {r.text[:500]}")
 
+    def insert_json_rows(self, table: str, rows: list[str]) -> None:
+        import urllib.parse
+        q = urllib.parse.quote(f"INSERT INTO {table} FORMAT JSONEachRow")
+        r = self.http.post(f"{self.base}/?query={q}", content="\n".join(rows).encode())
+        if r.status_code != 200:
+            raise RuntimeError(f"ClickHouse insert {r.status_code}: {r.text[:300]}")
+
     def scalar(self, sql: str, **params):
         rows = self.query(sql, **params)
         return next(iter(rows[0].values())) if rows else None

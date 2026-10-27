@@ -18,6 +18,12 @@ cfg = load_config()
 ch = ClickHouse()
 ORACLE = os.environ.get("ORACLE_URL", cfg["oracle"]["url"])
 app = FastAPI(title="lk-query-api")
+from .demo import router as demo_router  # noqa: E402
+
+app.include_router(demo_router)
+from .metrics import router as metrics_router  # noqa: E402
+
+app.include_router(metrics_router)
 _cache: dict = {}
 
 

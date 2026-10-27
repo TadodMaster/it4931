@@ -49,7 +49,7 @@ def swap(ch: ClickHouse, live: str, new: str, keep: int = 2) -> None:
         ch.execute(f"DROP TABLE IF EXISTS lk.{old} SYNC")
 
 
-def run(t_k: datetime, rule: str, run_id: str, trace: bool = True) -> dict:
+def run(t_k: datetime, rule: str, run_id: str, trace: bool = True, purge_current_day: bool = False) -> dict:
     cfg = load_config()
     base = f"http://{cfg['clickhouse']['host']}:{cfg['clickhouse']['http_port']}"
     ch = ClickHouse(base)
@@ -101,7 +101,7 @@ def run(t_k: datetime, rule: str, run_id: str, trace: bool = True) -> dict:
         "run_id": run_id, "t_k": t_k.strftime("%Y-%m-%d %H:%M:%S.000"), "rule_version": rule, "snapshot_id": str(snap),
         "view_version": tmp, "started_at": datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.000"),
         "duration_ms": dur, "input_rows": input_rows, "status": "ok"})])
-    publish_tk(cfg, t_k)
+    publish_tk(cfg, t_k, purge_current_day)
     spark.stop()
     out = {"run_id": run_id, "t_k": t_k.isoformat(), "rule": rule, "snapshot_id": snap, "input_rows": input_rows,
            "duration_ms": dur, "finished_at": now}
@@ -109,7 +109,7 @@ def run(t_k: datetime, rule: str, run_id: str, trace: bool = True) -> dict:
     return out
 
 
-def publish_tk(cfg: dict, t_k: datetime) -> None:
+def publish_tk(cfg: dict, t_k: datetime, purge_current_day: bool = False) -> None:
     """Tell the speed layer the new boundary, then drop its day buckets that the batch now covers."""
     import os
     r = redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), decode_responses=True)
@@ -117,7 +117,8 @@ def publish_tk(cfg: dict, t_k: datetime) -> None:
     cutoff = t_k.strftime("%Y-%m-%d")
     for key in r.scan_iter("rt:*:*"):
         day = key.split(":")[2]
-        if day < cutoff:
+        # nightly batches (t_k = day boundary) keep the t_k day; manual intra-day batches (quiescent system) purge it too
+        if day < cutoff or (purge_current_day and day == cutoff):
             r.delete(key)
 
 
@@ -127,9 +128,10 @@ def main() -> int:
     ap.add_argument("--rule", default="v1")
     ap.add_argument("--run-id")
     ap.add_argument("--no-trace", action="store_true")
+    ap.add_argument("--purge-current-day", action="store_true", help="manual batch at t_k inside a day: also drop that day's speed-layer buckets")
     a = ap.parse_args()
     tk = datetime.fromisoformat(a.t_k.replace("Z", "+00:00")).astimezone(timezone.utc)
-    run(tk, a.rule, a.run_id or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"), trace=not a.no_trace)
+    run(tk, a.rule, a.run_id or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"), trace=not a.no_trace, purge_current_day=a.purge_current_day)
     return 0
 
 

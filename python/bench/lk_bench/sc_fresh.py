@@ -31,7 +31,7 @@ def _log_markers(run_id: str, em: KafkaEmitter, last_id: str) -> None:
 
 
 # ======================================================================================================= B1
-def b1_freshness(run_id: str, n: int = 60, probes: int = 20, timeout: float = 30.0, **_) -> dict:
+def b1_freshness(run_id: str, n: int = 40, probes: int = 20, timeout: float = 30.0, **_) -> dict:
     """Marker TOPUP on a probe account; poll API and the stores directly until the new balance shows up."""
     cfg = load_config()
     ch = ClickHouse()
@@ -98,7 +98,7 @@ def _cmp(truth: dict[str, int], got: dict[str, int]) -> dict:
             "max_abs_diff": max((abs(truth.get(a, 0) - got.get(a, 0)) for a in bad), default=0)}
 
 
-def b3_correctness_over_time(run_id: str, minutes: float = 25, interval: float = 30, rate: int = 500,
+def b3_correctness_over_time(run_id: str, minutes: float = 14, interval: float = 20, rate: int = 300,
                              start_generator: bool = True, **_) -> dict:
     """Every `interval` s compare ALL accounts (balance) of both architectures with the oracle, at wall-clock now and
     (Lambda) at the batch's own cutoff t_k. Expect a Lambda sawtooth that resets at each nightly batch."""

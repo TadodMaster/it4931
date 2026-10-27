@@ -1,6 +1,9 @@
-# Demo-fast overlay (LK_PROFILE=fast): same behaviour, ~20x less data. Replay of history takes ~1.5 min.
+# Demo-fast overlay (LK_PROFILE=fast): same behaviour, ~65x less data than the 20 M default, simulated days twice as fast.
+# 1 simulated day = 300 real seconds (a "night" batch every 5 minutes); the 2-hour POS limit = 25 real seconds.
+time:
+  sim_speedup: 288
 data:
-  num_accounts: 10000
-  history_events: 1000000
+  num_accounts: 5000
+  history_events: 300000
 generator:
-  live_rate: 500
+  live_rate: 300

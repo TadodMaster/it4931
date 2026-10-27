@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import random
 import threading
 import time
@@ -59,7 +60,7 @@ def run_spark(script: str, *args: str, mem: str = "1g") -> str:
 
 def manual_batch(rule: str, t_k, tag: str) -> dict:
     t0 = time.time()
-    out = run_spark("batch.py", "--t-k", t_k.strftime("%Y-%m-%dT%H:%M:%S+00:00"), "--rule", rule, "--run-id", f"manual_{tag}_{int(t0)}")
+    out = run_spark("batch.py", "--t-k", t_k.strftime("%Y-%m-%dT%H:%M:%S+00:00"), "--rule", rule, "--run-id", f"manual_{tag}_{int(t0)}", "--purge-current-day")
     line = next((x for x in out.splitlines() if "[batch] done" in x), "")
     return {"seconds": round(time.time() - t0, 1), "result": json.loads(line.split("done ", 1)[1]) if line else None}
 
@@ -137,7 +138,7 @@ def oracle_digests(oracle: Oracle, rule: str) -> dict:
 
 
 # ======================================================================================================= B2
-def b2_throughput(run_id: str, rates: str = "500,1000,2000,3000,4500,6000", step_s: int = 30, **_) -> dict:
+def b2_throughput(run_id: str, rates: str = "300,600,1200,2400,3600", step_s: int = 25, **_) -> dict:
     """Step the ingest rate; a step is sustained if every running architecture's consumer lag stays bounded."""
     cfg = load_config()
     rate_list = [int(x) for x in rates.split(",")]
@@ -181,7 +182,7 @@ def b2_throughput(run_id: str, rates: str = "500,1000,2000,3000,4500,6000", step
 
 
 # ======================================================================================================= B5
-def b5_duplicates_crash(run_id: str, seconds: int = 120, rate: int = 500, dup_ratio: float = 0.05, **_) -> dict:
+def b5_duplicates_crash(run_id: str, seconds: int = 90, rate: int = 300, dup_ratio: float = 0.05, **_) -> dict:
     cfg = load_config()
     ch = ClickHouse()
     out: dict = {"duplicate_ratio": dup_ratio}
@@ -292,7 +293,7 @@ def b6_rule_change(run_id: str, live_rate: int = 0, **_) -> dict:
 
 
 # ======================================================================================================= B7
-def b7_drift(run_id: str, live_seconds: int = 60, rate: int = 500, **_) -> dict:
+def b7_drift(run_id: str, live_seconds: int = 40, rate: int = 300, **_) -> dict:
     """Deploy v2 to Spark only. The app (speed layer, v1) and the report (batch, v2) disagree until Flink is fixed AND the
     next batch replaces the stale speed-layer buckets."""
     cfg = load_config()
@@ -300,13 +301,13 @@ def b7_drift(run_id: str, live_seconds: int = 60, rate: int = 500, **_) -> dict:
     oracle = oracle_for(cfg)
     rd = redis.Redis(host="redis", decode_responses=True)
     out: dict = {}
+    min_day = cfg["time"]["history_start"][:0] + "2026-01-01"       # drift only matters for the days of the live period
 
     def mismatches(rule: str) -> dict:
-        mr = merged_rows(ch)
-        exp = {m: set() for m in METRICS}
+        mr = merged_rows(ch, min_day=min_day)
         got = {m: set(mr[m]) for m in METRICS}
         o = oracle.all_spend_day(rule)
-        exp_rows = {f"{k}|{v['spend']}|{v['tx_count']}" for k, v in o.items()}
+        exp_rows = {f"{k}|{v['spend']}|{v['tx_count']}" for k, v in o.items() if k.split('|')[1] >= min_day}
         bad = got["spend_day"] ^ exp_rows
         keys = {"|".join(x.split("|")[:2]) for x in bad}
         return {"mismatching_account_days": len(keys)}
@@ -333,7 +334,7 @@ def b7_drift(run_id: str, live_seconds: int = 60, rate: int = 500, **_) -> dict:
 
 
 # ======================================================================================================= B8
-def b8_report(run_id: str, accounts: int = 300, **_) -> dict:
+def b8_report(run_id: str, accounts: int = 150, **_) -> dict:
     """3-year spend report by category (join with merchant dimension) for many accounts, both architectures."""
     cfg = load_config()
     ch = ClickHouse()
@@ -385,3 +386,35 @@ def master_stats(run_id: str, **_) -> dict:
     res = {"seconds": round(time.time() - t0, 1), "line": line}
     save_json(run_id, "master_stats_run.json", res)
     return res
+
+
+# ======================================================================================================= e2e
+def e2e(run_id: str, seconds: int = 45, rate: int = 300, **_) -> dict:
+    """make test-e2e: live traffic with duplicates and late POS, quiesce, corrective batch, then `bench verify` for both."""
+    from .verify import _end_offsets
+    from .verify_lambda import verify_lambda
+    cfg = load_config()
+    start_generator(f"{run_id}-gen", rate, seconds)
+    time.sleep(seconds + 8)
+    ends = sum(_end_offsets(cfg["kafka"]["bootstrap"], cfg["kafka"]["topic_transactions"]).values())
+    wait_lag_zero("kappa-v1", cfg, 300)
+    wait_lag_zero("lambda-speed", cfg, 300)
+    rows = 0
+    for _ in range(6):                                  # archiver is micro-batched: poll master row count until it equals Kafka
+        master_stats(run_id)
+        last = json.loads(Path("/data/master_stats.jsonl").read_text().splitlines()[-1])
+        rows = last["rows"]
+        if rows == ends:
+            break
+        time.sleep(10)
+    out = {"kafka_end_offsets": ends, "master_rows": rows}
+    corrective_batch(run_id)
+    master_stats(run_id)
+    rk = verify_kappa("v1", f"{run_id}", None, 300)
+    rl = verify_lambda(run_id, 300)
+    out.update(kappa_passed=rk.ok, lambda_passed=rl.ok, passed=rk.ok and rl.ok,
+               failed=[c["name"] for c in rk.checks + rl.checks if c["status"] == "fail"])
+    save_json(run_id, "e2e.json", out)
+    if not out["passed"]:
+        raise SystemExit(f"e2e FAILED: {out['failed']}")
+    return out

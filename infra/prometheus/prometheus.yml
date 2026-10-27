@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: query-api
+    metrics_path: /metrics
+    static_configs: [{targets: ["query-api:8080"]}]
+  - job_name: flink
+    static_configs: [{targets: ["flink-jobmanager:9249", "flink-taskmanager:9249"]}]

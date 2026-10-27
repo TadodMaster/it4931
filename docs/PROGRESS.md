@@ -48,8 +48,43 @@ Environment incidents (honest log): (1) SeaweedFS OOM-killed once during the 20 
 became unresponsive (HTTP 500) until restarted; (3) `.env` variables override profile overlays — HISTORY_EVENTS in `.env` silently produced a 20 M
 dataset once; those variables are now commented out in `.env`/`.env.example`.
 
-## Phase 3 — Lambda path end to end — NOT STARTED
-## Phase 4 — fault injection, chaos, reprocessing, drift — NOT STARTED
-## Phase 5 — benchmarks B1–B10 — NOT STARTED
-## Phase 6 — report, demo UI, Grafana, RUNBOOK, demo-fast — NOT STARTED
-## Phase 7 — clean-clone final run — NOT STARTED
+## Phase 3 - Lambda path end to end - DONE (verified)
+
+Built: Iceberg master on S3 (`spark/load_master.py`, append-only, loaded from the SAME Parquet as Kafka), Spark archiver (Kafka -> Iceberg,
+exactly-once via checkpoint), nightly PySpark batch with one atomic `EXCHANGE TABLES` swap, `lambda_batch_runs` bookkeeping, Flink speed layer
+(Java, Redis day buckets, SET NX dedup), merge in the query-api (`/lambda/*`, `/trace/lambda`), `bench verify --arch lambda`.
+Rule vectors pass in **Python, SQL, Java and PySpark** (4 vectors x 2 rules each).
+Unit tests: 15 Python tests (host) + PySpark vectors (in the Spark image) + Java vectors and t_k boundary tests (Docker build).
+Verified (`results/e2e/verification_lambda.json`, 16 checks, all PASS on the 300 k-event profile after live traffic + corrective batch):
+batch view = oracle at its own t_k (3 metrics), serving (batch + speed) = oracle now (3 metrics), master rows = every Kafka event,
+master distinct ids and id-checksum = oracle, injected duplicates = duplicate rows in master, snapshots append-only, history checksums unchanged.
+Also done: swap atomicity under 6,117 concurrent reads + rollback (`results/final/proof_atomic_swap.json`, PASS).
+
+## Phase 4 - fault injection, chaos, reprocessing, drift - CODE COMPLETE, NOT YET RUN
+
+Implemented in `python/bench/lk_bench` (`bench run <name>`): `b5` (duplicates + kill TaskManager and Spark archiver, Kappa exactness,
+Lambda speed-layer error and corrective batch), `b6` (rule change v1->v2: Lambda = Spark + Flink + full batch, Kappa = job v2 from offset 0,
+lag curve, oracle check, view switch, zero-downtime pollers), `b7` (drift: Spark v2 only), `determinism` (Kappa replayed twice), `atomic` (done).
+**No B5/B6/B7/determinism result exists yet.** A first determinism attempt on the 1 M dataset was cancelled (checkpoint durations of 7-12 s made the
+replay far slower than the earlier 11.8 k events/s; default checkpoint interval is now 30 s).
+
+## Phase 5 - benchmarks B1-B10 - CODE COMPLETE, NOT YET RUN
+
+All ten scenarios exist (`b1`..`b10`, repetition via `--repeat`, `scripts/bench_all.sh` runs the whole sequence, about 1 hour on the fast profile).
+No B1-B10 numbers have been produced; therefore `docs/RESULTS.md` still contains no measurements and none are claimed anywhere.
+
+## Phase 6 - report, demo UI, Grafana, RUNBOOK, demo-fast - PARTLY DONE
+
+* RUNBOOK rewritten (presenter script included). Demo UI served at `/ui` (HTTP 200 checked; its buttons and the Lambda/Kappa/Truth columns have NOT been exercised in a browser).
+* Report generator `lk_bench/report.py` written (summary table, one chart per scenario, 1920x1080 slides, verification status, threats to validity) but **never executed**: expect small bugs on first run.
+* Prometheus + Grafana (profile `observability`) and the `/metrics` endpoint are written but **never started**.
+* `LK_PROFILE=fast` is now 300 k events, 5 k accounts, 300 tx/s, simulated day = 300 real seconds; `make demo-fast` exists but was not run as one command.
+
+## Phase 7 - clean-clone final run - NOT DONE
+
+`make clean && make reset && make bench-all && make report` has not been run from a clean clone. `make` itself is not installed on this Windows host (Makefile untested; the underlying commands were run by hand).
+
+## State of the machine when work stopped
+
+Stack is UP on the 300 k dataset (Kappa v1 caught up, Lambda batch scheduled). `results/final/` holds only `meta.json` and `proof_atomic_swap.json`.
+A benchmark run was started and stopped at the user's request; its later steps failed only because the bench container was restarted. Run `make reset` before a real benchmark.

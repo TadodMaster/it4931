@@ -34,14 +34,15 @@ def lambda_meta(ch: ClickHouse) -> dict | None:
     return {"t_k": r[0]["k1"], "rule": r[0]["k2"], "input_rows": int(r[0]["tx_count"])} if r else None
 
 
-def merged_rows(ch: ClickHouse) -> dict[str, list[str]]:
-    """What the serving layer returns for EVERY account: batch rows + Redis speed-layer buckets."""
+def merged_rows(ch: ClickHouse, min_day: str | None = None) -> dict[str, list[str]]:
+    """Serving-layer rows (batch + Redis speed layer) as digest strings. min_day limits the day rows (used by B7)."""
     from lk_api import lambda_ as lam
     r = lam.rds()
     bal: dict[str, int] = {}
     day: dict[tuple[str, str], list[int]] = {}
     cat: dict[tuple[str, str, str], int] = {}
-    for row in ch.query("SELECT kind, account_id, k1, k2, spend, tx_count FROM lk.lambda_batch_cur WHERE kind != 'meta'"):
+    where = " AND (kind != 'day' OR k1 >= '" + min_day + "')" if min_day else ""
+    for row in ch.query("SELECT kind, account_id, k1, k2, spend, tx_count FROM lk.lambda_batch_cur WHERE kind != 'meta'" + where):
         k, a, k1, k2 = row["kind"], row["account_id"], row["k1"], row["k2"]
         sp, c = int(row["spend"]), int(row["tx_count"])
         if k == "balance":
@@ -67,14 +68,50 @@ def merged_rows(ch: ClickHouse) -> dict[str, list[str]]:
             "spend_cat_month": [f"{a}|{c}|{m}|{v}" for (a, c, m), v in cat.items()]}
 
 
+RT_DDL = ("CREATE TABLE IF NOT EXISTS lk.lambda_rt_tmp (kind LowCardinality(String), account_id String, k1 String, k2 String, "
+          "spend Int64, tx_count UInt64) ENGINE = Memory")
+
+
+def _rt_rows() -> list[str]:
+    """Speed-layer buckets from Redis as batch-shaped rows (kind, account, k1, k2, spend, tx_count)."""
+    from lk_api import lambda_ as lam
+    r = lam.rds()
+    rows = []
+    for d in lam.rt_days():
+        for a, v in r.hscan_iter(f"rt:bal:{d}"):
+            rows.append(json.dumps({"kind": "balance", "account_id": a, "k1": "", "k2": "", "spend": int(v), "tx_count": 0}))
+        cnt = dict(r.hscan_iter(f"rt:cnt:{d}"))
+        for a, v in r.hscan_iter(f"rt:spend:{d}"):
+            rows.append(json.dumps({"kind": "day", "account_id": a, "k1": d, "k2": "", "spend": int(v), "tx_count": int(cnt.get(a, 0))}))
+        for f, v in r.hscan_iter(f"rt:cat:{d}"):
+            a, c, m = f.split("|")
+            rows.append(json.dumps({"kind": "cat_month", "account_id": a, "k1": c, "k2": m, "spend": int(v), "tx_count": 0}))
+    return rows
+
+
 def serving_matches_oracle(ch: ClickHouse, oracle: Oracle, rule: str) -> dict:
-    """Digest comparison of the merged serving view with the oracle at wall-clock now (all events)."""
-    mr = merged_rows(ch)
+    """Digest of what the serving layer returns for EVERY account (batch + speed layer) vs the oracle at wall-clock now.
+    The merge runs inside ClickHouse (speed-layer rows are loaded into a temp table) so nothing big crosses the wire."""
+    ch.execute(RT_DDL)
+    ch.execute("TRUNCATE TABLE lk.lambda_rt_tmp")
+    rt = _rt_rows()
+    for i in range(0, len(rt), 50_000):
+        ch.insert_json_rows("lk.lambda_rt_tmp", rt[i:i + 50_000])
+    u = "(SELECT kind, account_id, k1, k2, spend, tx_count FROM lk.lambda_batch_cur WHERE kind != 'meta' UNION ALL SELECT * FROM lk.lambda_rt_tmp)"
+    q = {
+        "balance": f"SELECT concat(account_id, '|', toString(sp)) AS s FROM (SELECT account_id, sum(spend) AS sp FROM {u} WHERE kind = 'balance' GROUP BY account_id)",
+        "spend_day": (f"SELECT concat(account_id, '|', k1, '|', toString(sp), '|', toString(c)) AS s FROM "
+                      f"(SELECT account_id, k1, sum(spend) AS sp, sum(tx_count) AS c FROM {u} WHERE kind = 'day' GROUP BY account_id, k1)"),
+        "spend_cat_month": (f"SELECT concat(account_id, '|', k1, '|', k2, '|', toString(sp)) AS s FROM "
+                            f"(SELECT account_id, k1, k2, sum(spend) AS sp FROM {u} WHERE kind = 'cat_month' GROUP BY account_id, k1, k2)"),
+    }
     out = {}
     for metric in METRICS:
         exp = oracle.digest(metric, rule, None)
-        got = _digest(mr[metric])
+        r = ch.query(f"SELECT count() AS n, sum({CH_HASH}) AS d FROM ({q[metric]})")[0]
+        got = {"rows": int(r["n"]), "digest": int(r["d"])}
         out[metric] = {"ok": exp == got, "oracle": exp, "serving": got}
+    ch.execute("TRUNCATE TABLE lk.lambda_rt_tmp")
     return out
 
 

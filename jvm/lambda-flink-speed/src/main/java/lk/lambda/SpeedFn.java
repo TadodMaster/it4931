@@ -58,10 +58,15 @@ public class SpeedFn extends RichMapFunction<Event, Long> {
         return tk;
     }
 
+    /** Boundary rule: the batch owns event_time < t_k, the speed layer owns event_time >= t_k (an event exactly at t_k is realtime). */
+    static boolean ownedBySpeedLayer(long eventTimeMs, long tk) {
+        return eventTimeMs >= tk;
+    }
+
     @Override
     public Long map(Event e) {
         try (Jedis j = pool.getResource()) {
-            if (e.eventTimeMs < currentTk(j)) {
+            if (!ownedBySpeedLayer(e.eventTimeMs, currentTk(j))) {
                 j.incr("stat:old");
                 return 0L;
             }

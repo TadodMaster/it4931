@@ -36,6 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--run-id", default=os.environ.get("RUN_ID", "local"))
     r.add_argument("--repeat", type=int, default=1)
     r.add_argument("--arg", action="append", help="scenario parameter key=value (repeatable)")
+    rp = sub.add_parser("report", help="build results/<run>/report.html, slides PNGs and docs/RESULTS.md from raw results")
+    rp.add_argument("--run-id", default=os.environ.get("RUN_ID", "final"))
     m = sub.add_parser("meta", help="record config, git commit, image digests, host info")
     m.add_argument("--run-id", default=os.environ.get("RUN_ID", "local"))
     a = ap.parse_args(argv)
@@ -50,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
         from lk_common.ch import ClickHouse, repoint_kappa_views
         repoint_kappa_views(ClickHouse(), a.to)
         print(f"kappa_current_* -> kappa_{a.to}_*")
+        return 0
+    if a.cmd == "report":
+        from .report import build
+        build(a.run_id)
         return 0
     from . import scenarios
     if a.cmd == "meta":

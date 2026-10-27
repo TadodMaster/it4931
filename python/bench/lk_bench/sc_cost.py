@@ -47,7 +47,7 @@ def _loc(paths: list[str]) -> int:
     return n
 
 
-def b9_cost(run_id: str, seconds: int = 90, rate: int = 500, label: str = "mixed", start_generator: bool = True, **_) -> dict:
+def b9_cost(run_id: str, seconds: int = 60, rate: int = 300, label: str = "mixed", start_generator: bool = True, **_) -> dict:
     """Sample docker stats while a steady load runs; add storage, service counts and lines of code."""
     from .sc_ops import start_generator as start_gen
     cfg = load_config()

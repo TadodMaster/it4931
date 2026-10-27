@@ -9,7 +9,7 @@ if [ "$JOB" = "lambda" ]; then
 else
   VERSION="${VERSION:-$RULE}"; NAME="kappa-${VERSION}"; JAR=/opt/jobs/kappa-flink-job.jar
   set -- --rule "$RULE" --version "$VERSION" --parallelism "${PARALLELISM:-2}" --start-from "${START_FROM:-committed}" \
-         --checkpoint-interval-ms "${CHECKPOINT_MS:-10000}"
+         --checkpoint-interval-ms "${CHECKPOINT_MS:-30000}"
 fi
 if flink list -r -m "$JM" 2>/dev/null | grep -q " ${NAME} "; then
   echo "[submit] ${NAME} already running"; exit 0

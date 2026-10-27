@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wallet Demo</title>
+<style>
+:root{--bg:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--grid:#e1e0d9;--ok:#006300;--bad:#d03b3b;--badbg:#fdeaea;--lam:#2a78d6;--kap:#eb6834;--tru:#1baf7a}
+@media (prefers-color-scheme: dark){:root:not([data-theme=light]){--bg:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--ok:#0ca30c;--bad:#e66767;--badbg:#3a1f1f;--lam:#3987e5;--kap:#d95926;--tru:#199e70}}
+body{background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;padding:16px}
+main{max-width:1150px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}.sub{color:var(--ink2);font-size:13px;margin-bottom:12px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+input,select,button{font:inherit;padding:6px 10px;border:1px solid var(--grid);border-radius:8px;background:var(--surface);color:var(--ink)}
+button{cursor:pointer}button:hover{border-color:var(--ink2)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.col{background:var(--surface);border:1px solid var(--grid);border-radius:10px;padding:12px;border-top:4px solid var(--c)}
+.col h2{font-size:16px;margin:0 0 6px;color:var(--ink)}.big{font-size:26px;font-weight:650}.lbl{color:var(--ink2);font-size:12px;margin-top:8px}
+.mis{background:var(--badbg);outline:2px solid var(--bad);border-radius:6px;padding:2px 6px}
+.asof{font-size:12px;color:var(--ink2);margin-top:6px;word-break:break-word}
+table{border-collapse:collapse;width:100%;font-size:12.5px}td{border-bottom:1px solid var(--grid);padding:2px 4px}td.n{text-align:right;font-variant-numeric:tabular-nums}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}pre{background:var(--surface);border:1px solid var(--grid);border-radius:8px;padding:8px;font-size:12px;overflow:auto}
+.scene{background:var(--surface);border:1px solid var(--grid);border-radius:10px;padding:10px;margin:10px 0}.scene h3{margin:0 0 6px;font-size:14px}
+</style>
+</head>
+<body>
+<main>
+<h1>Wallet app: Lambda | Kappa | Truth</h1>
+<div class="sub" id="clock">loading ...</div>
+<div class="bar">
+  <label>Account <input id="acct" size="9" value="A000001"></label>
+  <select id="probes"></select>
+  <button onclick="refresh()">Refresh</button>
+  <label><input type="checkbox" id="auto" checked> auto (2 s)</label>
+  <span id="verify"></span>
+</div>
+<div class="cols">
+  <div class="col" style="--c:var(--lam)"><h2>Lambda (batch + speed)</h2><div class="lbl">balance (VND)</div><div class="big" id="lb">-</div>
+    <div class="lbl">spend today (rule per batch)</div><div id="ls" class="big">-</div><div class="asof" id="la"></div></div>
+  <div class="col" style="--c:var(--kap)"><h2>Kappa (one streaming job)</h2><div class="lbl">balance (VND)</div><div class="big" id="kb">-</div>
+    <div class="lbl">spend today</div><div id="ks" class="big">-</div><div class="asof" id="ka"></div></div>
+  <div class="col" style="--c:var(--tru)"><h2>Truth (SQL oracle)</h2><div class="lbl">balance (VND)</div><div class="big" id="tb">-</div>
+    <div class="lbl">spend today</div><div id="ts" class="big">-</div><div class="asof" id="ta">independent of Kafka, Flink, Spark, Redis</div></div>
+</div>
+<div class="cols" style="margin-top:12px">
+  <div class="col" style="--c:var(--lam)"><h2>3-year report by category: Lambda</h2><div id="lr"></div></div>
+  <div class="col" style="--c:var(--kap)"><h2>3-year report by category: Kappa</h2><div id="kr"></div></div>
+  <div class="col" style="--c:var(--tru)"><h2>3-year report by category: Truth</h2><div id="tr"></div></div>
+</div>
+
+<div class="scene"><h3>Scene Y1: a payment appears within seconds</h3>
+  <button onclick="pay('PAYMENT',50000,0,'APP')">Pay 50,000 (app)</button>
+  <button onclick="pay('TOPUP',200000,0,'APP')">Top up 200,000</button>
+  <span id="paymsg" class="asof"></span></div>
+<div class="scene"><h3>Scene Y4: offline POS syncs 90 simulated minutes late</h3>
+  <button onclick="pay('PAYMENT',77000,90,'POS')">Inject 90-min-late POS payment</button>
+  <span class="asof">Kappa is exact at once; Lambda shows the right number only after the next nightly batch (watch the columns turn red, then green).</span></div>
+<div class="scene"><h3>Scene Y4 crash / Y3 rule change (run in a terminal)</h3>
+<pre>docker compose exec -T bench python -m lk_bench run b5       # kill TaskManager + archiver, duplicates on
+docker compose exec -T bench python -m lk_bench run b6       # rule v1 -> v2 on both architectures
+docker compose exec -T bench python -m lk_bench verify --arch kappa --rule v1 --run-id demo
+docker compose exec -T bench python -m lk_bench verify --arch lambda --run-id demo</pre></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const fmt=n=>n===null||n===undefined?'-':Number(n).toLocaleString('en-US');
+async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
+function paint(id,val,ref){const e=$(id);e.textContent=fmt(val);e.classList.toggle('mis',ref!==null&&val!==null&&val!==ref);}
+function report(id,rows){ if(!rows){$(id).textContent='n/a';return;}
+  const by={};rows.forEach(r=>{by[r.category]=(by[r.category]||0)+r.spend});
+  $(id).innerHTML='<table>'+Object.entries(by).sort().map(([c,v])=>`<tr><td>${c}</td><td class="n">${fmt(v)}</td></tr>`).join('')+'</table>'; }
+async function tryj(u){try{return await j(u)}catch(e){return null}}
+async function refresh(){
+  const a=$('acct').value.trim(), clock=await tryj('/sim/now'); if(!clock)return;
+  $('clock').textContent=`simulated time ${clock.sim_now} (x${clock.speedup}) - today = ${clock.sim_day}`;
+  const day=clock.sim_day;
+  const [lb,kb,tb,ls,ks,ts,lr,kr,tr]=await Promise.all([
+    tryj(`/lambda/balance/${a}`),tryj(`/kappa/balance/${a}`),tryj(`/truth/balance/${a}`),
+    tryj(`/lambda/spend/${a}?day=${day}`),tryj(`/kappa/spend/${a}?day=${day}`),tryj(`/truth/spend/${a}?day=${day}&rule=v1`),
+    tryj(`/lambda/report/${a}?from=2023-01&to=2026-12`),tryj(`/kappa/report/${a}?from=2023-01&to=2026-12`),tryj(`/truth/report/${a}?from=2023-01-01&to=2026-12-31&rule=v1`)]);
+  const T=tb?tb.balance:null, S=ts?ts.spend:null;
+  paint('lb',lb?lb.balance:null,T);paint('kb',kb?kb.balance:null,T);paint('tb',T,null);
+  paint('ls',ls?ls.spend:null,S);paint('ks',ks?ks.spend:null,S);paint('ts',S,null);
+  $('la').textContent=lb?`as of batch t_k=${lb.as_of.t_k} rule ${lb.as_of.rule}; speed-layer lag ${lb.as_of.speed_layer_consumer_lag}; realtime part ${fmt(lb.as_of.realtime_part)}`:'lambda not running';
+  $('ka').textContent=kb?`watermark ${kb.as_of.watermark_iso}; consumer lag ${kb.as_of.consumer_lag.total}; events counted ${kb.events_counted}, duplicates discarded ${kb.duplicates_discarded}`:'kappa not running';
+  report('lr',lr&&lr.rows);report('kr',kr&&kr.rows);report('tr',tr&&tr.rows);
+  const v=await tryj('/verify/latest'); $('verify').innerHTML=v?Object.entries(v).map(([k,x])=>`<span class="${x.passed?'ok':'bad'}">${k}: ${x.passed?'&#10003; verified':'&#10007; '+x.failed.length+' failed'}</span>`).join(' &nbsp; '):'';
+}
+async function pay(type,amount,late,ch){
+  const a=$('acct').value.trim(); const t0=performance.now();
+  const q=new URLSearchParams({account:a,type,amount,channel:ch,late_minutes:late});
+  const r=await j('/demo/marker?'+q,{method:'POST'}); $('paymsg').textContent=`sent ${type} ${fmt(amount)} (event ${r.event_id.slice(0,8)}) in ${(performance.now()-t0).toFixed(0)} ms`; refresh();
+}
+(async()=>{const c=await tryj('/sim/now'); if(c){const s=$('probes'); c.probe_accounts.slice(0,12).forEach(p=>{const o=document.createElement('option');o.value=o.textContent=p;s.appendChild(o)});
+  s.onchange=()=>{$('acct').value=s.value;refresh()}; $('acct').value=c.probe_accounts[0];}
+  refresh(); setInterval(()=>{if($('auto').checked)refresh()},2000);})();
+</script>
+</body>
+</html>
