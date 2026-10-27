@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>lk</groupId>
+  <artifactId>lk-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+
+  <modules>
+    <module>rules-java</module>
+    <module>flink-common</module>
+    <module>kappa-flink-job</module>
+    <module>lambda-flink-speed</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <flink.version>1.20.2</flink.version>
+    <flink.kafka.version>3.4.0-1.20</flink.kafka.version>
+    <jackson.version>2.17.2</jackson.version>
+    <snakeyaml.version>2.2</snakeyaml.version>
+    <junit.version>5.10.3</junit.version>
+    <!-- test vectors shared by all rule implementations (relative to the module dir) -->
+    <spec.path>${project.basedir}/../../shared/rules/spend_rules.yaml</spec.path>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>redis.clients</groupId><artifactId>jedis</artifactId><version>5.1.5</version></dependency>
+      <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>${jackson.version}</version></dependency>
+      <dependency><groupId>org.yaml</groupId><artifactId>snakeyaml</artifactId><version>${snakeyaml.version}</version></dependency>
+      <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>${junit.version}</version><scope>test</scope></dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>
+        <plugin>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+          <configuration><systemPropertyVariables><spec.path>${spec.path}</spec.path></systemPropertyVariables></configuration>
+        </plugin>
+        <plugin><artifactId>maven-shade-plugin</artifactId><version>3.5.3</version></plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

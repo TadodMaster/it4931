@@ -1,0 +1,56 @@
+# Single source of truth for tunables. Env vars with the same upper-case name override these.
+# Anything expressed in "sim_*" is simulated time; lk_common.config converts it to real time.
+run_id: local
+seed: 42
+
+time:
+  sim_speedup: 144              # 1 simulated day = 600 real seconds
+  history_start: "2023-01-01"   # inclusive, UTC
+  history_years: 3              # history_end = start + 3y (exclusive); live clock starts there
+  batch_period_sim_hours: 24    # Lambda nightly batch period P
+  pos_max_lateness_sim_hours: 2 # offline POS sync limit (Y4)
+  allowed_lateness_margin_sim_minutes: 10
+  watermark_out_of_orderness_sim_seconds: 60
+
+data:
+  num_accounts: 100000
+  num_merchants: 10000
+  num_probe_accounts: 50
+  history_events: 20000000
+  zipf_exponent: 0.8
+  paths:
+    root: data
+    merchants_csv: data/merchants.csv
+    stream_backfill: data/stream/backfill
+    truth_backfill: data/truth/backfill
+    truth_live: data/truth/live
+    manifest: data/backfill_manifest.json
+
+generator:
+  live_rate: 2000               # tx/s (real time)
+  live_tick_seconds: 1.0
+  late_pos_ratio: 0.03          # share of POS events that sync late (<= 2 sim hours)
+  beyond_limit_ratio: 0.0       # share of POS events later than the limit (B4 only)
+  duplicate_ratio: 0.01
+  out_of_order_jitter_ms: 2000
+
+kafka:
+  bootstrap: kafka:9092         # in-compose; host uses localhost:29092
+  topic_transactions: transactions
+  topic_merchants: merchants
+  topic_late_events: late-events
+  topic_rules_control: rules-control
+  partitions: 6
+
+s3:
+  endpoint: http://seaweedfs:9000
+  region: us-east-1
+  buckets: [master, warehouse, checkpoints, results]
+
+clickhouse:
+  host: clickhouse
+  http_port: 8123
+  database: lk
+
+oracle:
+  url: http://oracle:8090

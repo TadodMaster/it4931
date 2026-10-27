@@ -1,0 +1,6 @@
+# Demo-fast overlay (LK_PROFILE=fast): same behaviour, ~20x less data. Replay of history takes ~1.5 min.
+data:
+  num_accounts: 10000
+  history_events: 1000000
+generator:
+  live_rate: 500

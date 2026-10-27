@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+data/
+run/
+results/*
+!results/.gitkeep
+target/
+*.log
+.vscode

@@ -1,0 +1,371 @@
+# Lambda vs Kappa demo. Profiles: core (always) | lambda | kappa | observability | demo-ui
+# Memory budget (limits, MiB): kafka 1280, seaweedfs 768, iceberg-rest 512, clickhouse 2048, oracle 1024,
+# generator 1024, bench 512, init containers ~128  => core ≈ 7.3 GiB worst case, ≈ 3.5 GiB typical.
+# Docker Desktop must be given >= 10 GiB (WSL2: memory=12GB in %UserProfile%\.wslconfig) once lambda/kappa are up.
+# Cost benchmarks run ONE of lambda/kappa at a time so they do not compete.
+
+x-python: &python
+  image: lk-python:dev
+  build:
+    context: .
+    dockerfile: infra/docker/python.Dockerfile
+  env_file: [.env]
+  volumes:
+    - ./data:/data
+    - ./results:/app/python/results
+
+x-spark: &spark
+  image: lk-spark:dev
+  build:
+    context: .
+    dockerfile: infra/docker/spark.Dockerfile
+  user: root
+  env_file: [.env]
+  environment:
+    REDIS_HOST: redis
+    SPARK_MASTER: local[2]
+    AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+    AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  volumes:
+    - ./data:/data
+    - ./results:/app/spark/results
+
+x-flink: &flink
+  image: lk-flink-job:dev
+  build:
+    context: .
+    dockerfile: infra/docker/flink-job.Dockerfile
+  environment:
+    ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.2.jar
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: flink-jobmanager
+      jobmanager.memory.process.size: 768m
+      taskmanager.memory.process.size: ${FLINK_TM_MB:-1536}m
+      taskmanager.numberOfTaskSlots: 6
+      s3.endpoint: http://seaweedfs:9000
+      s3.path.style.access: true
+      s3.access-key: ${S3_ACCESS_KEY:?}
+      s3.secret-key: ${S3_SECRET_KEY:?}
+      rest.flamegraph.enabled: false
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    profiles: [core]
+    hostname: kafka
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_HEAP_OPTS: -Xms768m -Xmx768m
+    volumes: [kafka-data:/var/lib/kafka/data]
+    mem_limit: 1280m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    profiles: [core]
+    depends_on:
+      kafka: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "/init/create-topics.sh"]
+    volumes: ["./infra/kafka/init:/init:ro"]
+    mem_limit: 256m
+    restart: "no"
+
+  # Object store. MinIO no longer publishes pullable official images (see docs/DESIGN.md D1), so the
+  # official SeaweedFS image provides the same S3 API. Buckets: master, warehouse, checkpoints, results.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.97
+    profiles: [core]
+    hostname: seaweedfs
+    ports: ["9000:9000"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /tmp/s3.json <<EOF
+        {"identities":[{"name":"demo","credentials":[{"accessKey":"$${S3_ACCESS_KEY}","secretKey":"$${S3_SECRET_KEY}"}],
+        "actions":["Admin","Read","Write","List","Tagging"]}]}
+        EOF
+        exec /usr/bin/weed server -dir=/data -ip=seaweedfs -master.volumeSizeLimitMB=512 -volume.max=200 \
+          -s3 -s3.port=9000 -s3.config=/tmp/s3.json
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?copy .env.example to .env}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?copy .env.example to .env}
+    volumes: [s3-data:/data]
+    mem_limit: 1024m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000"]   # localhost resolves to ::1 in this image; S3 listens on v4
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  bucket-init:
+    <<: *python
+    profiles: [core]
+    command: ["python", "-m", "lk_common.init_buckets"]
+    depends_on:
+      seaweedfs: {condition: service_healthy}
+    mem_limit: 128m
+    restart: "no"
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    profiles: [core]
+    hostname: iceberg-rest
+    ports: ["8181:8181"]
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://seaweedfs:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?}
+      AWS_REGION: us-east-1
+      # SeaweedFS stores aws-chunked trailer framing literally: ask the AWS SDK v2 for plain PUTs (see docs/DESIGN.md D1)
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    depends_on:
+      bucket-init: {condition: service_completed_successfully}
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/config >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33.6
+    profiles: [core]
+    hostname: clickhouse
+    ports: ["8123:8123", "9009:9000"]
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./infra/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    mem_limit: 2048m
+    ulimits: {nofile: {soft: 262144, hard: 262144}}
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client -q 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  oracle:
+    <<: *python
+    profiles: [core]
+    command: ["python", "-m", "lk_oracle.app"]
+    volumes:
+      - ./data:/data:ro
+      - ./results:/app/python/results
+    ports: ["8090:8090"]
+    mem_limit: 1024m
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u;u.urlopen('http://localhost:8090/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  query-api:
+    <<: *python
+    profiles: [core]
+    command: ["python", "-m", "uvicorn", "lk_api.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      REDIS_HOST: redis
+    ports: ["8080:8080"]
+    depends_on:
+      clickhouse: {condition: service_healthy}
+      oracle: {condition: service_healthy}
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u;u.urlopen('http://localhost:8080/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Tool containers: idle, used with `docker compose exec generator python -m lk_generator ...`
+  generator:
+    <<: *python
+    profiles: [core]
+    command: ["sleep", "infinity"]
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    mem_limit: 1024m
+
+  bench:
+    <<: *python
+    profiles: [core]
+    command: ["sleep", "infinity"]
+    environment:
+      REDIS_HOST: redis
+      FLINK_REST: http://flink-jobmanager:8081
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-it4931}
+    volumes:
+      - ./data:/data
+      - ./results:/app/python/results
+      - ./docs:/app/docs
+      - ./:/repo:ro                                  # lines-of-code count, compose profiles, git commit (read-only)
+      - /var/run/docker.sock:/var/run/docker.sock   # chaos tests (kill/restart), docker stats; demo tool only
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+      clickhouse: {condition: service_healthy}
+      oracle: {condition: service_healthy}
+    mem_limit: 512m
+
+  # ---- profile kappa: ONE Flink job is the whole architecture ----
+  flink-jobmanager:
+    <<: *flink
+    profiles: [kappa, lambda]
+    hostname: flink-jobmanager
+    command: jobmanager
+    ports: ["8081:8081"]
+    mem_limit: 1024m
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8081'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      bucket-init: {condition: service_completed_successfully}
+
+  flink-taskmanager:
+    <<: *flink
+    profiles: [kappa, lambda]
+    command: taskmanager
+    mem_limit: ${FLINK_TM_LIMIT_MB:-1750}m
+    restart: unless-stopped            # chaos tests kill it; Flink restarts the job from the last checkpoint
+    depends_on:
+      flink-jobmanager: {condition: service_healthy}
+
+  kappa-submit:
+    <<: *flink
+    profiles: [kappa]
+    entrypoint: ["/bin/sh", "/submit.sh"]
+    volumes: ["./infra/flink/submit.sh:/submit.sh:ro"]
+    environment:
+      RULE: ${KAPPA_RULE:-v1}
+      START_FROM: ${KAPPA_START_FROM:-committed}
+      PARALLELISM: ${KAPPA_PARALLELISM:-2}
+    depends_on:
+      flink-taskmanager: {condition: service_started}
+      kafka-init: {condition: service_completed_successfully}
+      clickhouse: {condition: service_healthy}
+    restart: "no"
+    mem_limit: 512m
+
+  # ---- profile lambda: Spark archiver + nightly batch + Flink speed layer + Redis + merge in query-api ----
+  redis:
+    image: redis:7.4.5-alpine
+    profiles: [lambda]
+    hostname: redis
+    command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "noeviction", "--appendonly", "no", "--save", ""]
+    ports: ["6379:6379"]
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  lambda-init:
+    <<: *spark
+    profiles: [lambda]
+    command: ["python3", "/app/spark/lambda_init.py"]
+    depends_on:
+      redis: {condition: service_healthy}
+    mem_limit: 256m
+    restart: "no"
+
+  lambda-speed-submit:
+    <<: *flink
+    profiles: [lambda]
+    entrypoint: ["/bin/sh", "/submit.sh"]
+    volumes: ["./infra/flink/submit.sh:/submit.sh:ro"]
+    environment:
+      JOB: lambda
+      RULE: ${LAMBDA_FLINK_RULE:-v1}
+      START_FROM: ${LAMBDA_START_FROM:-committed}
+    depends_on:
+      flink-taskmanager: {condition: service_started}
+      lambda-init: {condition: service_completed_successfully}
+    restart: "no"
+    mem_limit: 512m
+
+  spark-load-master:
+    <<: *spark
+    profiles: [lambda-load]
+    command: ["/opt/spark/bin/spark-submit", "--driver-memory", "1536m", "/app/spark/load_master.py"]
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+    mem_limit: 2g
+    restart: "no"
+
+  spark-master-stats:
+    <<: *spark
+    profiles: [lambda-tools]
+    command: ["/opt/spark/bin/spark-submit", "--driver-memory", "768m", "/app/spark/master_stats.py"]
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+    mem_limit: 1200m
+    restart: "no"
+
+  spark-archiver:
+    <<: *spark
+    profiles: [lambda]
+    command: ["/opt/spark/bin/spark-submit", "--driver-memory", "640m", "/app/spark/archiver.py"]
+    volumes:
+      - ./data:/data
+      - ./results:/app/spark/results
+      - spark-ckpt:/checkpoints          # local volume: Hadoop S3A cannot create directories on SeaweedFS (DESIGN D11)
+    environment:
+      REDIS_HOST: redis
+      SPARK_MASTER: local[2]
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      ARCHIVER_CHECKPOINT: /checkpoints/spark-archiver
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+    mem_limit: 1024m
+    restart: unless-stopped            # chaos tests kill it mid-stream; the checkpoint makes the restart exactly-once
+
+  spark-scheduler:
+    <<: *spark
+    profiles: [lambda]
+    command: ["python3", "/app/spark/scheduler.py"]
+    depends_on:
+      lambda-init: {condition: service_completed_successfully}
+      clickhouse: {condition: service_healthy}
+      iceberg-rest: {condition: service_healthy}
+    mem_limit: 1700m
+    restart: unless-stopped
+
+volumes:
+  spark-ckpt:
+  kafka-data:
+  s3-data:
+  ch-data:

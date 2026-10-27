@@ -1,0 +1,97 @@
+# Single specification of the spending rule. Implemented independently in:
+#   rules-python (PySpark batch layer), rules-java (Flink speed layer + Kappa), rules-sql (oracle).
+# Every implementation must pass `test_vectors` below.
+
+money: "integer VND only, never floats. Day / month are UTC calendar buckets of event_time."
+
+balance:
+  # independent of the spending rule
+  positive: [TOPUP, REFUND, TRANSFER_IN, CASHBACK]
+  negative: [PAYMENT, TRANSFER_OUT]
+
+category:
+  # spend-by-category key. PAYMENT/REFUND use the merchant's category;
+  # TRANSFER_OUT has no merchant and goes to the pseudo category TRANSFER,
+  # so that for every month: sum over categories == sum over days (conservation invariant).
+  merchant_types: [PAYMENT, REFUND]
+  transfer_pseudo_category: TRANSFER
+
+rules:
+  v1:
+    description: "spend = PAYMENT + TRANSFER_OUT"
+    contributions:
+      PAYMENT: "+amount"
+      TRANSFER_OUT: "+amount"
+  v2:
+    description: >
+      spend = PAYMENT - REFUND (refund counted on its own event day, category of its merchant)
+      + TRANSFER_OUT where is_self_transfer = false
+    contributions:
+      PAYMENT: "+amount"
+      REFUND: "-amount"
+      TRANSFER_OUT: "+amount if not is_self_transfer"
+  # tx_count = number of events that contribute (even with a negative sign); events the
+  # rule does not touch (self transfer under v2, REFUND under v1) are not counted.
+
+test_vectors:
+  - name: payment_and_transfer
+    merchants: {M00001: FOOD}
+    events:
+      - {id: e1, account: A000001, time: "2026-01-05T10:00:00.000Z", type: PAYMENT, amount: 50000, merchant: M00001, self: false}
+      - {id: e2, account: A000001, time: "2026-01-05T11:00:00.000Z", type: TRANSFER_OUT, amount: 200000, merchant: null, self: false}
+      - {id: e3, account: A000001, time: "2026-01-05T12:00:00.000Z", type: TOPUP, amount: 1000000, merchant: null, self: false}
+    expect:
+      v1:
+        balance: {A000001: 750000}
+        spend_day: {"A000001|2026-01-05": {spend: 250000, tx_count: 2}}
+        spend_cat_month: {"A000001|FOOD|2026-01": 50000, "A000001|TRANSFER|2026-01": 200000}
+      v2:
+        balance: {A000001: 750000}
+        spend_day: {"A000001|2026-01-05": {spend: 250000, tx_count: 2}}
+        spend_cat_month: {"A000001|FOOD|2026-01": 50000, "A000001|TRANSFER|2026-01": 200000}
+
+  - name: refund_and_self_transfer_differ_between_rules
+    merchants: {M00002: SHOPPING}
+    events:
+      - {id: e1, account: A000002, time: "2026-02-10T09:00:00.000Z", type: PAYMENT, amount: 300000, merchant: M00002, self: false}
+      - {id: e2, account: A000002, time: "2026-02-11T09:00:00.000Z", type: REFUND, amount: 100000, merchant: M00002, self: false}
+      - {id: e3, account: A000002, time: "2026-02-11T10:00:00.000Z", type: TRANSFER_OUT, amount: 500000, merchant: null, self: true}
+      - {id: e4, account: A000002, time: "2026-02-11T11:00:00.000Z", type: TRANSFER_OUT, amount: 70000, merchant: null, self: false}
+      - {id: e5, account: A000002, time: "2026-02-11T12:00:00.000Z", type: CASHBACK, amount: 3000, merchant: null, self: false}
+    expect:
+      v1:
+        balance: {A000002: -767000}      # -300000 +100000 -500000 -70000 +3000
+        spend_day:
+          "A000002|2026-02-10": {spend: 300000, tx_count: 1}
+          "A000002|2026-02-11": {spend: 570000, tx_count: 2}
+        spend_cat_month: {"A000002|SHOPPING|2026-02": 300000, "A000002|TRANSFER|2026-02": 570000}
+      v2:
+        balance: {A000002: -767000}
+        spend_day:
+          "A000002|2026-02-10": {spend: 300000, tx_count: 1}
+          "A000002|2026-02-11": {spend: -30000, tx_count: 2}    # -100000 refund + 70000 external transfer
+        spend_cat_month: {"A000002|SHOPPING|2026-02": 200000, "A000002|TRANSFER|2026-02": 70000}
+
+  - name: refund_crosses_month_boundary
+    merchants: {M00003: TRANSPORT}
+    events:
+      - {id: e1, account: A000003, time: "2026-03-31T23:59:59.999Z", type: PAYMENT, amount: 80000, merchant: M00003, self: false}
+      - {id: e2, account: A000003, time: "2026-04-01T00:00:00.000Z", type: REFUND, amount: 80000, merchant: M00003, self: false}
+    expect:
+      v1:
+        balance: {A000003: 0}
+        spend_day: {"A000003|2026-03-31": {spend: 80000, tx_count: 1}}
+        spend_cat_month: {"A000003|TRANSPORT|2026-03": 80000}
+      v2:
+        balance: {A000003: 0}
+        spend_day: {"A000003|2026-03-31": {spend: 80000, tx_count: 1}, "A000003|2026-04-01": {spend: -80000, tx_count: 1}}
+        spend_cat_month: {"A000003|TRANSPORT|2026-03": 80000, "A000003|TRANSPORT|2026-04": -80000}
+
+  - name: transfer_in_and_cashback_only
+    merchants: {}
+    events:
+      - {id: e1, account: A000004, time: "2026-05-01T08:00:00.000Z", type: TRANSFER_IN, amount: 400000, merchant: null, self: false}
+      - {id: e2, account: A000004, time: "2026-05-01T09:00:00.000Z", type: CASHBACK, amount: 5000, merchant: null, self: false}
+    expect:
+      v1: {balance: {A000004: 405000}, spend_day: {}, spend_cat_month: {}}
+      v2: {balance: {A000004: 405000}, spend_day: {}, spend_cat_month: {}}
