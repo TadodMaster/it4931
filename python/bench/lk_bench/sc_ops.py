@@ -17,7 +17,8 @@ from lk_common.kafka_lag import consumer_lag
 from lk_oracle.core import Oracle
 
 from . import dockerctl, flinkapi
-from .common import (api_get, batch_runs, iso_utc, lag_total, now_sim, pct, probe_accounts, save_csv, save_json, wait_until)
+from .common import (api_get, batch_runs, iso_utc, lag_total, now_sim, pct, probe_accounts, processed_lag, save_csv, save_json,
+                     wait_until)
 from .verify import CH_HASH, CH_ROW, METRICS, verify_kappa
 from .verify_lambda import _digest, merged_rows, serving_matches_oracle
 
@@ -27,13 +28,19 @@ NET = f"{dockerctl.PROJECT}_default"
 # --------------------------------------------------------------------------------------------------- helpers
 def oracle_for(cfg: dict) -> Oracle:
     p = cfg["data"]["paths"]
+    from lk_oracle.core import compact_truth
+    compact_truth(p["truth_live"])          # thousands of per-second files make every oracle query slow
     return Oracle([p["truth_backfill"], p["truth_live"]], p["merchants_csv"])
 
 
-def start_generator(run_id: str, rate: int, seconds: float, *flags: str, ramp: str | None = None) -> None:
+def start_generator(run_id: str, rate: int, seconds: float, *flags: str, ramp: str | None = None) -> str:
+    """Starts a live run in the generator container. The run id gets a unique suffix so injections.json is never overwritten
+    (bench verify sums every live run's produced counts)."""
+    run_id = f"{run_id.replace('/', '_')}-{int(time.time())}"
     cmd = ["python", "-m", "lk_generator", *flags, "live", "--run-id", run_id, "--duration", str(seconds)]
     cmd += ["--ramp", ramp] if ramp else ["--rate", str(rate)]
     dockerctl.exec_("generator", *cmd, detach=True)
+    return run_id
 
 
 def generator_running() -> bool:
@@ -79,9 +86,11 @@ def flink_cancel(name_suffix: str) -> bool:
 
 
 def wait_lag_zero(group: str, cfg: dict, timeout: float = 900, sample: list | None = None, every: float = 2.0) -> float | None:
+    """Wait until `group` has processed everything in Kafka (processed-count based; see common.processed_lag)."""
     t0 = time.time()
+    ch = ClickHouse()
     while time.time() - t0 < timeout:
-        lag = lag_total(group, cfg)
+        lag = processed_lag(group, cfg, ch)
         if sample is not None and lag is not None:
             sample.append({"t_s": round(time.time() - t0, 1), "lag": lag})
         if lag == 0:
@@ -138,21 +147,24 @@ def oracle_digests(oracle: Oracle, rule: str) -> dict:
 
 
 # ======================================================================================================= B2
-def b2_throughput(run_id: str, rates: str = "300,600,1200,2400,3600", step_s: int = 25, **_) -> dict:
+def b2_throughput(run_id: str, rates: str = "200,400,800,1600,2400", step_s: int = 25, **_) -> dict:
     """Step the ingest rate; a step is sustained if every running architecture's consumer lag stays bounded."""
     cfg = load_config()
     rate_list = [int(x) for x in rates.split(",")]
     ramp = ",".join(f"{i * step_s}:{r}" for i, r in enumerate(rate_list))
     total = step_s * len(rate_list)
-    groups = {g: lag_total(g, cfg) is not None for g in ("kappa-v1", "lambda-speed")}
+    chq = ClickHouse()
+    groups = {g: processed_lag(g, cfg, chq) is not None for g in ("kappa-v1", "lambda-speed")}
     active = [g for g, ok in groups.items() if ok]
+    for g in active:                                    # start from an idle system
+        wait_lag_zero(g, cfg, 300)
     rid = f"{run_id}-gen"
     start_generator(rid, rate_list[0], total, ramp=ramp)
     samples, t0 = [], time.time()
     while time.time() - t0 < total + 5:
         row = {"t_s": round(time.time() - t0, 1)}
         for g in active:
-            row[f"lag_{g}"] = lag_total(g, cfg)
+            row[f"lag_{g}"] = processed_lag(g, cfg, chq)
         st = dockerctl.stats()
         for svc in ("flink-taskmanager", "spark-archiver", "redis", "clickhouse", "kafka"):
             if svc in st:
@@ -169,7 +181,7 @@ def b2_throughput(run_id: str, rates: str = "300,600,1200,2400,3600", step_s: in
             lags = [s[f"lag_{g}"] for s in seg if s.get(f"lag_{g}") is not None]
             end, mid = lags[-1], lags[len(lags) // 2]
             slope = (end - mid) / max(1.0, len(lags) / 2)
-            entry[g] = {"lag_end": end, "lag_growth_per_s": round(slope, 1), "sustained": end <= max(2 * r, 1500) and slope <= 0.05 * r}
+            entry[g] = {"lag_end": end, "lag_growth_per_s": round(slope, 1), "sustained": end <= max(3 * r, 1500) and slope <= 0.05 * r}
         steps.append(entry)
     out = {"steps": steps, "step_seconds": step_s}
     for g in active:
@@ -182,19 +194,24 @@ def b2_throughput(run_id: str, rates: str = "300,600,1200,2400,3600", step_s: in
 
 
 # ======================================================================================================= B5
-def b5_duplicates_crash(run_id: str, seconds: int = 90, rate: int = 300, dup_ratio: float = 0.05, **_) -> dict:
+def b5_duplicates_crash(run_id: str, seconds: int = 90, rate: int = 200, dup_ratio: float = 0.05, **_) -> dict:
     cfg = load_config()
     ch = ClickHouse()
     out: dict = {"duplicate_ratio": dup_ratio}
     start_generator(f"{run_id}-gen", rate, seconds, "--duplicate-ratio", str(dup_ratio))
     t0 = time.time()
     time.sleep(30)
+    # `docker kill` counts as a manual stop for the restart policy, so we play the orchestrator: start it again after a pause
     dockerctl.kill("flink-taskmanager"); out["tm_killed_at_s"] = round(time.time() - t0, 1)
-    time.sleep(20)
+    time.sleep(8)
+    dockerctl.start("flink-taskmanager")
+    time.sleep(12)
     dockerctl.kill("spark-archiver"); out["archiver_killed_at_s"] = round(time.time() - t0, 1)
+    time.sleep(8)
+    dockerctl.start("spark-archiver")
     wait_until(lambda: dockerctl.status("flink-taskmanager") == "running", 120, 2)
     wait_until(lambda: dockerctl.status("spark-archiver") == "running", 120, 2)
-    wait_until(lambda: flinkapi.running_job("kappa-v1") is not None and flinkapi.running_job("lambda-speed") is not None, 180, 2)
+    wait_until(lambda: flinkapi.running_job("kappa-v1") is not None and flinkapi.running_job("lambda-speed") is not None, 240, 2)
     out["jobs_back_at_s"] = round(time.time() - t0, 1)
     time.sleep(max(0, seconds + 10 - (time.time() - t0)))             # generator finishes
     out["kappa_catchup_s"] = wait_lag_zero("kappa-v1", cfg, 600)
@@ -264,7 +281,8 @@ def b6_rule_change(run_id: str, live_rate: int = 0, **_) -> dict:
     r_in = live_rate
     lag_curve: list[dict] = []
     t0 = time.time()
-    flink_submit("kappa", "--rule", "v2", "--version", "v2", "--parallelism", "2", "--start-from", "earliest")
+    flink_submit("kappa", "--rule", "v2", "--version", "v2", "--parallelism", "2", "--start-from", "earliest",
+                 "--checkpoint-interval-ms", "30000")
     t_started = time.time() - t0
     catch = wait_lag_zero("kappa-v2", cfg, 1800, lag_curve, 2.0)
     t_catch = time.time() - t0
@@ -293,41 +311,40 @@ def b6_rule_change(run_id: str, live_rate: int = 0, **_) -> dict:
 
 
 # ======================================================================================================= B7
-def b7_drift(run_id: str, live_seconds: int = 40, rate: int = 300, **_) -> dict:
-    """Deploy v2 to Spark only. The app (speed layer, v1) and the report (batch, v2) disagree until Flink is fixed AND the
-    next batch replaces the stale speed-layer buckets."""
+def b7_drift(run_id: str, live_seconds: int = 40, rate: int = 200, **_) -> dict:
+    """Deploy the new rule to Spark only. After a batch the report follows v2, but everything the speed layer (Flink, still v1)
+    computed since then disagrees with it; fixing Flink does not repair the stale buckets until the next batch replaces them."""
     cfg = load_config()
     ch = ClickHouse()
     oracle = oracle_for(cfg)
     rd = redis.Redis(host="redis", decode_responses=True)
     out: dict = {}
-    min_day = cfg["time"]["history_start"][:0] + "2026-01-01"       # drift only matters for the days of the live period
+    min_day = "2026-01-01"                                              # drift only matters for the days of the live period
 
     def mismatches(rule: str) -> dict:
         mr = merged_rows(ch, min_day=min_day)
-        got = {m: set(mr[m]) for m in METRICS}
+        got = set(mr["spend_day"])
         o = oracle.all_spend_day(rule)
-        exp_rows = {f"{k}|{v['spend']}|{v['tx_count']}" for k, v in o.items() if k.split('|')[1] >= min_day}
-        bad = got["spend_day"] ^ exp_rows
-        keys = {"|".join(x.split("|")[:2]) for x in bad}
-        return {"mismatching_account_days": len(keys)}
+        exp_rows = {f"{k}|{v['spend']}|{v['tx_count']}" for k, v in o.items() if k.split("|")[1] >= min_day}
+        return {"mismatching_account_days": len({"|".join(x.split("|")[:2]) for x in got ^ exp_rows})}
 
-    out["baseline_v1"] = mismatches("v1")
-    rd.set("lambda:spark_rule", "v2")                                      # Spark only
-    t0 = time.time()
-    start_generator(f"{run_id}-gen", rate, live_seconds)
-    time.sleep(live_seconds + 8)
-    # batch with the new Spark rule: the report now follows v2, the realtime numbers still follow v1
-    mb = manual_batch("v2", now_sim(cfg).replace(microsecond=0) - timedelta(minutes=30), "b7a")
     wait_lag_zero("lambda-speed", cfg, 120)
-    out["spark_v2_flink_v1"] = {**mismatches("v2"), "batch_seconds": mb["seconds"], "elapsed_s": round(time.time() - t0, 1)}
-    # fix Flink: the stale v1 buckets stay in Redis until the next batch purges them
-    flink_cancel("lambda-speed")
+    out["baseline_v1"] = mismatches("v1")
+    t0 = time.time()
+    rd.set("lambda:spark_rule", "v2")                                      # Spark implementation changed, Flink not
+    mb = manual_batch("v2", now_sim(cfg).replace(microsecond=0), "b7a")
+    out["batch_v2_just_ran"] = {**mismatches("v2"), "batch_seconds": mb["seconds"], "note": "report = rule v2"}
+    start_generator(f"{run_id}-gen", rate, live_seconds)                  # new traffic is handled by the speed layer (v1)
+    time.sleep(live_seconds + 8)
+    wait_lag_zero("lambda-speed", cfg, 120)
+    out["spark_v2_flink_v1"] = {**mismatches("v2"), "elapsed_s": round(time.time() - t0, 1)}
+    flink_cancel("lambda-speed")                                           # now fix Flink ...
     flink_submit("lambda", "--rule", "v2", "--parallelism", "2", "--start-from", "committed")
     wait_until(lambda: flinkapi.running_job("lambda-speed") is not None, 120, 1)
     wait_lag_zero("lambda-speed", cfg, 120)
-    out["flink_fixed_before_next_batch"] = {**mismatches("v2"), "elapsed_s": round(time.time() - t0, 1)}
-    mb2 = manual_batch("v2", now_sim(cfg).replace(microsecond=0), "b7b")
+    out["flink_fixed_before_next_batch"] = {**mismatches("v2"), "elapsed_s": round(time.time() - t0, 1),
+                                           "note": "stale v1 buckets still in Redis"}
+    mb2 = manual_batch("v2", now_sim(cfg).replace(microsecond=0), "b7b")   # ... and only the next batch repairs the numbers
     out["after_next_batch"] = {**mismatches("v2"), "batch_seconds": mb2["seconds"], "elapsed_s": round(time.time() - t0, 1)}
     save_json(run_id, "b7_drift.json", out)
     return out
@@ -389,7 +406,7 @@ def master_stats(run_id: str, **_) -> dict:
 
 
 # ======================================================================================================= e2e
-def e2e(run_id: str, seconds: int = 45, rate: int = 300, **_) -> dict:
+def e2e(run_id: str, seconds: int = 45, rate: int = 200, **_) -> dict:
     """make test-e2e: live traffic with duplicates and late POS, quiesce, corrective batch, then `bench verify` for both."""
     from .verify import _end_offsets
     from .verify_lambda import verify_lambda

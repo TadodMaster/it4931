@@ -21,6 +21,7 @@ class Oracle:
         self.lock = threading.Lock()
         self.merchants_csv = merchants_csv
         self._merchants_loaded = False
+        self.excluded: set[str] = set()
         self.con.execute(RULES_SQL.read_text())
 
     # -- truth view, rebuilt per query so live-appended files are always seen ---------------------------------
@@ -34,10 +35,12 @@ class Oracle:
         globs = [f"{r}/**/*.parquet" for r in self.truth_roots if any(Path(r).rglob("*.parquet"))]
         if not globs:
             raise RuntimeError("no truth files found")
+        self.con.execute("CREATE TABLE IF NOT EXISTS excluded (event_id VARCHAR)")
         lst = ", ".join("'" + g.replace("\\", "/").replace("'", "''") + "'" for g in globs)  # config paths, not user input
         self.con.execute(
             "CREATE OR REPLACE VIEW truth AS SELECT event_id, account_id, event_time, type, amount, merchant_id, "
-            f"is_self_transfer, channel, pos_offline FROM read_parquet([{lst}], union_by_name=true)")
+            f"is_self_transfer, channel, pos_offline FROM read_parquet([{lst}], union_by_name=true) "
+            "WHERE event_id NOT IN (SELECT event_id FROM excluded)")
 
     def _q(self, sql: str, params: list | None = None) -> list[tuple]:
         with self.lock:
@@ -47,6 +50,15 @@ class Oracle:
     @staticmethod
     def _cut(cutoff: str | None) -> tuple[str, list]:
         return ("AND event_time < CAST(? AS TIMESTAMPTZ)", [cutoff]) if cutoff else ("", [])
+
+    def exclude(self, event_ids: set[str]) -> None:
+        """Events the architecture legitimately did not apply (Kappa: beyond the lateness limit, kept in late-events)."""
+        with self.lock:
+            self.con.execute("CREATE TABLE IF NOT EXISTS excluded (event_id VARCHAR)")
+            self.con.execute("DELETE FROM excluded")
+            if event_ids:
+                self.con.executemany("INSERT INTO excluded VALUES (?)", [[e] for e in event_ids])
+        self.excluded = set(event_ids)
 
     # -- scalar / per-account ----------------------------------------------------------------------------------
     def balance(self, account: str, cutoff: str | None = None) -> int:
@@ -172,3 +184,30 @@ class Oracle:
         sql, p = self._row_sql(metric, rule, cutoff)
         ph = ",".join("?" * len(accounts))
         return sorted(r[0] for r in self._q(f"SELECT s FROM ({sql}) WHERE a IN ({ph})", p + accounts))
+
+
+def compact_truth(root: str, min_files: int = 40, min_age_s: float = 30.0) -> dict:
+    """Merge the per-second live truth files of every run directory into one Parquet file (content unchanged).
+
+    Only files older than `min_age_s` are touched, so a live run that is still writing is left alone. Run it when no oracle query is
+    in flight (bench does it before scenarios that query the oracle hundreds of times)."""
+    import time
+    out = {"merged_files": 0, "dirs": 0}
+    for d in sorted(Path(root).iterdir()) if Path(root).exists() else []:
+        if not d.is_dir():
+            continue
+        files = [f for f in d.glob("part-*.parquet") if time.time() - f.stat().st_mtime > min_age_s]
+        if len(files) < min_files:
+            continue
+        target = d / f"compact-{time.time_ns()}.parquet"
+        tmp = d / (target.name + ".tmp")
+        lst = ", ".join("'" + str(f).replace("\\", "/").replace("'", "''") + "'" for f in files)
+        con = duckdb.connect()
+        con.execute(f"COPY (SELECT * FROM read_parquet([{lst}], union_by_name=true)) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        con.close()
+        tmp.replace(target)
+        for f in files:
+            f.unlink()
+        out["merged_files"] += len(files)
+        out["dirs"] += 1
+    return out

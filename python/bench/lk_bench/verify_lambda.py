@@ -127,6 +127,8 @@ def verify_lambda(run_id: str = "local", lag_timeout: float = 300, merged: bool 
     rule = meta["rule"]
     lag = wait_for_lag_zero(cfg, "lambda-speed", lag_timeout)
     rep.add("speed layer caught up (consumer lag 0)", lag["total"] == 0, lag=lag["total"], waited_s=lag["waited_s"])
+    from lk_oracle.core import compact_truth
+    compact_truth(paths["truth_live"])
     oracle = Oracle([paths["truth_backfill"], paths["truth_live"]], paths["merchants_csv"])
 
     # 1a. batch view == oracle at the batch's own cutoff t_k

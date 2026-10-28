@@ -18,6 +18,7 @@ def atomic_swap(run_id: str, accounts: int = 60, **_) -> dict:
     version (the old t_k with the old checksum, or the new t_k with the new checksum), never a mix. Then roll back."""
     cfg = load_config()
     ch = ClickHouse()
+    wait_until(lambda: ch.query("SELECT 1 FROM lk.lambda_batch_cur WHERE kind = 'meta' LIMIT 1"), 600, 5)   # first nightly batch
     accts = [r["account_id"] for r in ch.query(f"SELECT DISTINCT account_id FROM lk.lambda_batch_cur WHERE kind = 'balance' LIMIT {accounts}")]
     in_list = ",".join(f"'{a}'" for a in accts)
     sql = ("SELECT anyIf(k1, kind = 'meta') AS tk, count() AS n, sum(cityHash64(kind, account_id, k1, k2, spend, tx_count)) AS cs "
@@ -35,9 +36,13 @@ def atomic_swap(run_id: str, accounts: int = 60, **_) -> dict:
     th = threading.Thread(target=hammer, daemon=True)
     th.start()
     time.sleep(1)
-    mb = manual_batch(ch.query("SELECT k2 FROM lk.lambda_batch_cur WHERE kind='meta'")[0]["k2"],
-                      now_sim(cfg).replace(microsecond=0) - timedelta(minutes=1), "atomic")
-    time.sleep(1)
+    rule = ch.query("SELECT k2 FROM lk.lambda_batch_cur WHERE kind='meta'")[0]["k2"]
+    mb = {}
+    for attempt in range(1, 4):                      # the swap must happen while the reader is running: both versions have to be observed
+        mb = manual_batch(rule, now_sim(cfg).replace(microsecond=0) - timedelta(minutes=attempt), f"atomic{attempt}")
+        time.sleep(2)
+        if len({k[0] for k in seen}) >= 2:
+            break
     stop = True
     th.join()
     by_tk: dict[str, set] = {}
@@ -54,7 +59,7 @@ def atomic_swap(run_id: str, accounts: int = 60, **_) -> dict:
         rolled = ch.query("SELECT k1 FROM lk.lambda_batch_cur WHERE kind='meta'")[0]["k1"]
         ch.execute(f"EXCHANGE TABLES lk.lambda_batch_cur AND lk.{prev[0]['name']}")      # and forward again
         out["rollback"] = {"t_k_before": cur_tk, "t_k_after_rollback": rolled, "worked": rolled != cur_tk}
-    out["passed"] = consistent and len(by_tk) <= 2 and out.get("rollback", {}).get("worked", False)
+    out["passed"] = consistent and 2 <= len(by_tk) <= 4 and out.get("rollback", {}).get("worked", False)
     save_json(run_id, "proof_atomic_swap.json", out)
     return out
 
@@ -65,7 +70,8 @@ def replay_determinism(run_id: str, **_) -> dict:
     ch = ClickHouse()
     assert flinkapi.running_job("kappa-v1"), "kappa-v1 must be running"
     wait_lag_zero("kappa-v1", cfg, 300)
-    flink_submit("kappa", "--rule", "v1", "--version", "v1b", "--parallelism", "2", "--start-from", "earliest")
+    flink_submit("kappa", "--rule", "v1", "--version", "v1b", "--parallelism", "2", "--start-from", "earliest",
+                 "--checkpoint-interval-ms", "30000")
     t0 = time.time()
     dt = wait_lag_zero("kappa-v1b", cfg, 1800)
     wait_lag_zero("kappa-v1", cfg, 300)

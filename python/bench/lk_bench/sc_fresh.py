@@ -23,11 +23,11 @@ def _emitter(cfg: dict, run_id: str):
             TruthWriter(cfg["data"]["paths"]["truth_live"], run_id))
 
 
-def _log_markers(run_id: str, em: KafkaEmitter, last_id: str) -> None:
+def _log_markers(run_id: str, em: KafkaEmitter, last_id: str, beyond: int = 0) -> None:
     """One line with CUMULATIVE per-partition delivery counts of this emitter (bench verify sums these)."""
     from .common import run_dir
     with open(run_dir(run_id) / "markers.jsonl", "a") as f:
-        f.write(json.dumps({"event_id": last_id, "kafka": em.counts()}) + "\n")
+        f.write(json.dumps({"event_id": last_id, "kafka": em.counts(), "beyond_limit": beyond}) + "\n")
 
 
 # ======================================================================================================= B1
@@ -91,14 +91,17 @@ def _lambda_all_balances(ch: ClickHouse) -> tuple[dict[str, int], dict[str, int]
     return merged, batch, meta[0]["k1"] if meta else None
 
 
-def _cmp(truth: dict[str, int], got: dict[str, int]) -> dict:
+def _cmp(truth: dict[str, int], got: dict[str, int], truth2: dict[str, int] | None = None) -> dict:
+    """An account matches if the system equals the oracle read before OR after the system was read (events in flight while
+    we measure are not errors; a missing late event matches neither)."""
     accts = set(truth) | set(got)
-    bad = [a for a in accts if truth.get(a, 0) != got.get(a, 0)]
+    t2 = truth2 or truth
+    bad = [a for a in accts if got.get(a, 0) not in (truth.get(a, 0), t2.get(a, 0))]
     return {"accounts": len(accts), "mismatched": len(bad), "exact_pct": round(100 * (1 - len(bad) / max(1, len(accts))), 3),
             "max_abs_diff": max((abs(truth.get(a, 0) - got.get(a, 0)) for a in bad), default=0)}
 
 
-def b3_correctness_over_time(run_id: str, minutes: float = 14, interval: float = 20, rate: int = 300,
+def b3_correctness_over_time(run_id: str, minutes: float = 12, interval: float = 20, rate: int = 200,
                              start_generator: bool = True, **_) -> dict:
     """Every `interval` s compare ALL accounts (balance) of both architectures with the oracle, at wall-clock now and
     (Lambda) at the batch's own cutoff t_k. Expect a Lambda sawtooth that resets at each nightly batch."""
@@ -107,19 +110,19 @@ def b3_correctness_over_time(run_id: str, minutes: float = 14, interval: float =
     paths = cfg["data"]["paths"]
     oracle = Oracle([paths["truth_backfill"], paths["truth_live"]], paths["merchants_csv"])
     if start_generator:
-        dockerctl.exec_("generator", "python", "-m", "lk_generator", "live", "--run-id", f"{run_id}-gen", "--rate", str(rate),
-                        "--duration", str(minutes * 60 + 5), detach=True)
+        from .sc_ops import start_generator as _sg
+        _sg(f"{run_id}-gen", rate, minutes * 60 + 5)
         time.sleep(5)
     rows, t0 = [], time.time()
     seen_runs: set[str] = set()
     while time.time() - t0 < minutes * 60:
         ts = time.time()
         truth = oracle.all_balances()
-        from .common import kappa_balance_direct  # noqa: F401
         kap = {r["account_id"]: int(r["balance"]) for r in ch.query("SELECT account_id, balance FROM lk.kappa_current_account")}
         merged, batch, tk = _lambda_all_balances(ch)
+        truth2 = oracle.all_balances()
         asof = oracle.all_balances(cutoff=tk) if tk else {}
-        k, lm, lb = _cmp(truth, kap), _cmp(truth, merged), (_cmp(asof, batch) if tk else {})
+        k, lm, lb = _cmp(truth, kap, truth2), _cmp(truth, merged, truth2), (_cmp(asof, batch) if tk else {})
         runs = batch_runs(ch)
         new_batch = [r["run_id"] for r in runs if r["run_id"] not in seen_runs]
         seen_runs.update(new_batch)
@@ -142,62 +145,73 @@ def b3_correctness_over_time(run_id: str, minutes: float = 14, interval: float =
 
 # ======================================================================================================= B4
 def b4_late_pos(run_id: str, in_limit: int = 40, beyond: int = 5, wait_next_batch_s: float = 900, **_) -> dict:
-    """Burst of offline-POS events (<= 2 sim hours late) right after a nightly batch, plus a few beyond the limit.
-    Lambda corrects only at the next batch; Kappa is exact immediately (beyond-limit events go to late-events)."""
+    """Offline-POS burst (<= 2 simulated hours late) injected at the moment a nightly batch starts, plus a few events beyond the limit.
+    The batch reads its snapshot at the start; the events arrive afterwards with event_time < t_k, so neither the batch nor the
+    speed layer (which hands over at t_k) counts them until the NEXT batch. Kappa is exact at once."""
     cfg = load_config()
     ch = ClickHouse()
     tc_limit = timedelta(hours=cfg["time"]["pos_max_lateness_sim_hours"])
     em, tw = _emitter(cfg, run_id)
     probes = probe_accounts(cfg)
     ok_acc, bad_acc = probes[20:35], probes[35:40]
-    # inject right after a batch completed so that event_time < t_k (outside the speed layer's responsibility)
-    runs0 = batch_runs(ch)
-    print("[b4] waiting for the next nightly batch boundary ...", flush=True)
-    dt, _ = wait_until(lambda: len(batch_runs(ch)) > len(runs0), 1500, 2)
-    assert dt is not None, "no batch ran within 25 minutes (is spark-scheduler up?)"
-    last = batch_runs(ch)[-1]
-    tk_dt = clock(cfg).sim_now().replace(hour=0, minute=0, second=0, microsecond=0)
-    from lk_common.config import parse_ts
-    tk = parse_ts(last["t_k"].replace(" ", "T") + "Z")
-    base_k = {a: kappa_balance_api(a) for a in ok_acc + bad_acc}
+    clk = clock(cfg)
+    boundary = clk.sim_now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    wait_real = (boundary - clk.sim_now()).total_seconds() / clk.tc.sim_speedup
+    print(f"[b4] waiting {wait_real:.0f} s for the sim-day boundary {boundary.isoformat()} (the nightly batch starts then) ...", flush=True)
+    time.sleep(max(0.0, wait_real))
+    time.sleep(6)                                                   # the scheduler polls every 5 s; the batch snapshot is taken at its start
     base_l = {a: lambda_balance_api(a) for a in ok_acc + bad_acc}
-    exp_ok = dict(base_l)
+    base_k = {a: kappa_balance_api(a) for a in ok_acc + bad_acc}
     now = now_sim(cfg)
-    t_inject = time.time()
     rnd = random.Random(7)
-    last_id = ""
+    exp_ok, exp_bad, last_id = dict(base_l), dict(base_l), ""
     for i in range(in_limit):
         a = ok_acc[i % len(ok_acc)]
         amt = 10_000 + 1000 * i
-        et = tk - timedelta(minutes=rnd.randint(1, 55))
-        assert now - et <= tc_limit, "event would exceed the POS limit; inject sooner after the batch"
+        et = max(boundary - timedelta(minutes=rnd.randint(1, 55)), now - tc_limit + timedelta(minutes=5))
         row = emit_marker(cfg, tw, em, account=a, type_="PAYMENT", amount=amt, merchant="M00001", channel="POS",
                           event_time_ms=int(et.timestamp() * 1000), pos_offline=True)
         last_id = row["event_id"]
-        exp_ok[a] += -amt
-    exp_bad = dict(base_l)
+        exp_ok[a] -= amt
     for i in range(beyond):
         a = bad_acc[i % len(bad_acc)]
         et = now - timedelta(hours=3)
         emit_marker(cfg, tw, em, account=a, type_="PAYMENT", amount=20_000 + i, merchant="M00001", channel="POS",
                     event_time_ms=int(et.timestamp() * 1000), pos_offline=True)
         exp_bad[a] -= 20_000 + i
-    _log_markers(run_id, em, last_id)
-    state = lambda fn, exp: all(fn(a) == exp[a] for a in exp)  # noqa: E731
-    k_dt, _ = wait_until(lambda: state(kappa_balance_api, exp_ok), 60, 0.1)
-    l_ok = wait_until(lambda: state(lambda_balance_api, exp_ok), wait_next_batch_s, 2)
-    l_bad = wait_until(lambda: state(lambda_balance_api, exp_bad), wait_next_batch_s, 2)
-    kappa_bad_now = {a: kappa_balance_api(a) for a in bad_acc}
+    _log_markers(run_id, em, last_id, beyond)
+    t_inj = time.time()
+    exact = lambda fn, exp: all(fn(a) == exp[a] for a in exp)      # noqa: E731
+    timeline, k_dt = [], None
+    while time.time() - t_inj < wait_next_batch_s:
+        t = time.time() - t_inj
+        k_ok = exact(kappa_balance_api, exp_ok)
+        l_ok = exact(lambda_balance_api, exp_ok)
+        if k_ok and k_dt is None:
+            k_dt = t
+        timeline.append({"t_s": round(t, 1), "kappa_exact": k_ok, "lambda_exact": l_ok,
+                         "lambda_exact_beyond_limit": exact(lambda_balance_api, exp_bad)})
+        # done once Lambda is exact again AND a batch that started after the injection has been published
+        newer_batch = any(int(r["started_ms"]) > t_inj * 1000 for r in batch_runs(ch))
+        if l_ok and newer_batch and len(timeline) > 1 and timeline[-2]["lambda_exact"]:
+            break
+        time.sleep(1.5)
+    save_csv(run_id, "b4_timeline.csv", timeline)
+    wrong = [x["t_s"] for x in timeline if not x["lambda_exact"]]
+    final_exact = next((x["t_s"] for x in reversed(timeline) if not x["lambda_exact"]), None)
     from .verify import _late_event_ids
     late_ids = _late_event_ids(cfg)
-    out = {"batch_t_k": last["t_k"], "in_limit_events": in_limit, "beyond_limit_events": beyond,
+    kappa_bad_now = {a: kappa_balance_api(a) for a in bad_acc}
+    out = {"in_limit_events": in_limit, "beyond_limit_events": beyond, "batch_boundary": boundary.isoformat(),
            "kappa_exact_after_s": None if k_dt is None else round(k_dt, 2),
-           "lambda_exact_after_s": None if l_ok[0] is None else round(l_ok[0], 1),
-           "lambda_exact_after_sim_minutes": None if l_ok[0] is None else round(l_ok[0] * cfg["time"]["sim_speedup"] / 60, 1),
-           "lambda_beyond_limit_exact_after_s": None if l_bad[0] is None else round(l_bad[0], 1),
+           "lambda_inexact_seconds": len(wrong) and round(max(wrong) - min(wrong), 1),
+           "lambda_exact_after_s": None if final_exact is None else round(final_exact, 1),
+           "lambda_exact_after_sim_minutes": None if final_exact is None else round(final_exact * cfg["time"]["sim_speedup"] / 60, 1),
+           "lambda_ever_inexact": bool(wrong),
+           "lambda_beyond_limit_final_exact": exact(lambda_balance_api, exp_bad),
            "kappa_beyond_limit_accounts_equal_truth": all(kappa_bad_now[a] == exp_bad[a] for a in bad_acc),
            "kappa_late_events_topic_distinct_ids": len(late_ids),
-           "note": "beyond-limit events are NOT applied by Kappa (they sit in late-events, never silently dropped); "
-                   "Lambda recomputes all history, so it absorbs arbitrarily late events at the next batch"}
+           "note": "beyond-limit events are NOT applied by Kappa (they sit in late-events, never silently dropped); Lambda recomputes "
+                   "all history, so it absorbs arbitrarily late events once the next batch has run"}
     save_json(run_id, "b4_late_pos.json", out)
     return out

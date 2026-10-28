@@ -119,3 +119,41 @@ def iso_utc(dt: datetime) -> str:
 
 
 __all__ = ["timedelta"]
+
+
+# ---- lag measured from PROCESSED counts (committed Kafka offsets only advance at Flink checkpoints) -----------------
+def kafka_end_total(cfg: dict) -> int:
+    from .verify import _end_offsets
+    return sum(_end_offsets(cfg["kafka"]["bootstrap"], cfg["kafka"]["topic_transactions"]).values())
+
+
+def kappa_processed(ch: ClickHouse, version: str) -> int | None:
+    """Events the Kappa job version has handled (accepted + duplicates + late), read from its own output table."""
+    try:
+        r = ch.query(f"SELECT sum(n) AS s FROM (SELECT account_id, argMax(accepted + duplicates + late, version) AS n "
+                     f"FROM lk.kappa_{version}_account GROUP BY account_id)")
+        return int(r[0]["s"] or 0)
+    except Exception:  # noqa: BLE001 - table does not exist yet
+        return None
+
+
+def speed_processed() -> int:
+    import redis
+    r = redis.Redis(host="redis", decode_responses=True)
+    return sum(int(r.get(k) or 0) for k in ("stat:accepted", "stat:dup", "stat:old"))
+
+
+def backfill_total(cfg: dict) -> int:
+    p = Path(cfg["data"]["paths"]["root"]) / "kafka_load_manifest.json"
+    return int(json.loads(p.read_text())["sent"])
+
+
+def processed_lag(group: str, cfg: dict, ch: ClickHouse) -> int | None:
+    """Messages still to be processed by `group` (kappa-<ver> or lambda-speed); None if that architecture is not running."""
+    end = kafka_end_total(cfg)
+    if group.startswith("kappa-"):
+        n = kappa_processed(ch, group.split("-", 1)[1])
+        return None if n is None else max(0, end - n)
+    if group == "lambda-speed":
+        return max(0, end - backfill_total(cfg) - speed_processed())   # speed layer starts at the end of the backfill
+    return lag_total(group, cfg)

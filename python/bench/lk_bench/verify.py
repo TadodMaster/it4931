@@ -67,12 +67,12 @@ def _produced_by_partition(cfg: dict) -> tuple[dict[int, int], dict]:
         m = json.loads(lm.read_text())
         add(m["delivered"]["by_partition"])
         src["backfill_load"] = m["delivered"]["total"]
-    for f in sorted(glob.glob("results/*/injections.json")):
+    for f in sorted(glob.glob("results/**/injections.json", recursive=True)):
         d = json.loads(Path(f).read_text()).get("live")
         if d:
             add(d["kafka"]["by_partition"])
             src["live_runs"].append({"run": Path(f).parent.name, "events": d["kafka"]["total"], "final": d["final"]})
-    for f in sorted(glob.glob("results/*/markers.jsonl")):
+    for f in sorted(glob.glob("results/**/markers.jsonl", recursive=True)):
         for line in Path(f).read_text().splitlines():
             add(json.loads(line)["kafka"]["by_partition"])
             src["markers"] += 1
@@ -88,7 +88,10 @@ def _injected(cfg: dict) -> dict:
         inj["late_pos"] += m["late_pos"]
         inj["beyond_limit"] += m["beyond_limit"]
         inj["logical"] += m["logical_events"]
-    for f in glob.glob("results/*/injections.json"):
+    for f in glob.glob("results/**/markers.jsonl", recursive=True):       # beyond-limit markers injected by B4
+        for line in Path(f).read_text().splitlines():
+            inj["beyond_limit"] += int(json.loads(line).get("beyond_limit", 0))
+    for f in glob.glob("results/**/injections.json", recursive=True):
         d = json.loads(Path(f).read_text()).get("live")
         if d:
             for k in ("duplicates", "late_pos", "beyond_limit", "logical"):
@@ -120,7 +123,12 @@ def verify_kappa(rule: str = "v1", run_id: str = "local", cutoff: str | None = N
     lag = wait_for_lag_zero(cfg, group, lag_timeout)
     rep.add("consumer caught up (committed offsets reach end offsets)", lag["total"] == 0,
             lag=lag["total"], waited_s=lag["waited_s"])
+    from lk_oracle.core import compact_truth
+    compact_truth(paths["truth_live"])
     oracle = Oracle([paths["truth_backfill"], paths["truth_live"]], paths["merchants_csv"])
+    late_n = int(ch.scalar("SELECT sum(late) FROM lk.kappa_current_account") or 0)
+    late_ids = _late_event_ids(cfg) if late_n > 0 else set()
+    oracle.exclude(late_ids)               # events beyond the lateness limit are in late-events, deliberately not applied
 
     # 1. oracle equality (exact integer equality of every row of every metric)
     for metric in METRICS:
@@ -143,9 +151,8 @@ def verify_kappa(rule: str = "v1", run_id: str = "local", cutoff: str | None = N
     rep.add("sum(spend over days) = sum(spend over categories) = oracle global total",
             int(ks["s"]) == int(kc["s"]) == t["spend_sum"], days=int(ks["s"]), categories=int(kc["s"]), oracle=t["spend_sum"])
     rep.add("spend-contributing events = oracle", int(ks["c"]) == t["spend_events"], kappa=int(ks["c"]), oracle=t["spend_events"])
-    late_ids = _late_event_ids(cfg) if int(kb["late"]) > 0 else set()
-    rep.add("events counted = logical events - late-events (distinct)", int(kb["acc"]) == t["events"] - len(late_ids),
-            kappa_accepted=int(kb["acc"]), oracle_events=t["events"], late_distinct=len(late_ids))
+    rep.add("events counted = logical events - late-events (distinct)", int(kb["acc"]) == t["events"],
+            kappa_accepted=int(kb["acc"]), oracle_events_excluding_late=t["events"], late_distinct=len(late_ids))
     trace_n = int(ch.scalar("SELECT uniqExact(event_id) FROM lk.kappa_current_trace"))
     rep.add("trace table holds every accepted event exactly once", trace_n == int(kb["acc"]), trace_distinct=trace_n)
 

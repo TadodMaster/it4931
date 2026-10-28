@@ -56,10 +56,20 @@ def health():
     return {"ok": True}
 
 
+def kt(name: str) -> str:
+    """Table of the ACTIVE Kappa version (the version behind the atomically repointed kappa_current_* views). Queries filter by account
+    before aggregating: going through the aggregating views would scan the whole table."""
+    v = _cached("kv", 5, lambda: current_kappa_version(ch))
+    if not v:
+        raise HTTPException(503, "no kappa view is active yet")
+    return f"lk.kappa_{v}_{name}"
+
+
 @app.get("/kappa/balance/{account}")
 def kappa_balance(account: str):
-    rows = ch.query("SELECT balance, accepted, duplicates, late, ver AS version FROM lk.kappa_current_account "
-                    "WHERE account_id = {a:String}", a=account)
+    rows = ch.query(f"SELECT argMax(balance, version) AS balance, argMax(accepted, version) AS accepted, "
+                    f"argMax(duplicates, version) AS duplicates, argMax(late, version) AS late, max(version) AS ver "
+                    f"FROM {kt('account')} WHERE account_id = {{a:String}} GROUP BY account_id", a=account)
     r = rows[0] if rows else {"balance": 0, "accepted": 0, "duplicates": 0, "late": 0, "version": 0}
     return {"account": account, "balance": int(r["balance"]), "events_counted": int(r["accepted"]),
             "duplicates_discarded": int(r["duplicates"]), "late_events": int(r["late"]), "as_of": kappa_as_of()}
@@ -67,8 +77,8 @@ def kappa_balance(account: str):
 
 @app.get("/kappa/spend/{account}")
 def kappa_spend(account: str, day: str):
-    rows = ch.query("SELECT spend, tx_count FROM lk.kappa_current_spend_day WHERE account_id = {a:String} AND day = {d:Date}",
-                    a=account, d=day)
+    rows = ch.query(f"SELECT argMax(spend, version) AS spend, argMax(tx_count, version) AS tx_count FROM {kt('spend_day')} "
+                    f"WHERE account_id = {{a:String}} AND day = {{d:Date}} GROUP BY account_id, day", a=account, d=day)
     r = rows[0] if rows else {"spend": 0, "tx_count": 0}
     return {"account": account, "day": day, "spend": int(r["spend"]), "tx_count": int(r["tx_count"]), "as_of": kappa_as_of()}
 
@@ -76,8 +86,9 @@ def kappa_spend(account: str, day: str):
 @app.get("/kappa/report/{account}")
 def kappa_report(account: str, frm: str = Query(alias="from"), to: str = "9999-12"):
     """Spend by (month, category) for months frm[:7] .. to[:7] inclusive."""
-    rows = ch.query("SELECT month, category, spend FROM lk.kappa_current_spend_cat_month WHERE account_id = {a:String} "
-                    "AND month >= {f:String} AND month <= {t:String} ORDER BY month, category", a=account, f=frm[:7], t=to[:7])
+    rows = ch.query(f"SELECT month, category, argMax(spend, version) AS spend FROM {kt('spend_cat_month')} WHERE account_id = {{a:String}} "
+                    f"AND month >= {{f:String}} AND month <= {{t:String}} GROUP BY month, category ORDER BY month, category",
+                    a=account, f=frm[:7], t=to[:7])
     return {"account": account, "rows": [{"month": r["month"], "category": r["category"], "spend": int(r["spend"])} for r in rows],
             "as_of": kappa_as_of()}
 
@@ -93,9 +104,9 @@ def trace(arch: str, account: str, day: str):
                 "tx_count": sum(e["spend_contribution"] is not None for e in events), "as_of": lambda_as_of(info)}
     if arch != "kappa":
         raise HTTPException(404, "unknown architecture")
-    rows = ch.query("SELECT event_id, formatDateTime(event_time, '%Y-%m-%dT%H:%i:%S.%f', 'UTC') AS event_time, type, amount, merchant_id, "
-                    "is_self_transfer, pos_offline, spend_contribution FROM lk.kappa_current_trace "
-                    "WHERE account_id = {a:String} AND day = {d:Date} ORDER BY event_time, event_id", a=account, d=day)
+    rows = ch.query(f"SELECT event_id, formatDateTime(event_time, '%Y-%m-%dT%H:%i:%S.%f', 'UTC') AS event_time, type, amount, merchant_id, "
+                    f"is_self_transfer, pos_offline, spend_contribution FROM {kt('trace')} FINAL "
+                    f"WHERE account_id = {{a:String}} AND day = {{d:Date}} ORDER BY event_time, event_id", a=account, d=day)
     events = [{**r, "amount": int(r["amount"]), "spend_contribution": None if r["spend_contribution"] is None
                else int(r["spend_contribution"])} for r in rows]
     return {"account": account, "day": day, "events": events,
