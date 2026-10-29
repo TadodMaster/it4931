@@ -19,7 +19,7 @@ from lk_spark.common import MASTER_TABLE, create_master_table, spark_session
 def main() -> int:
     cfg = load_config()
     paths = cfg["data"]["paths"]
-    spark = spark_session("lk-load-master", shuffle_partitions=4, driver_mem="1536m")
+    spark = spark_session("lk-load-master", shuffle_partitions=4, driver_mem="1g")
     create_master_table(spark)
     if spark.table(MASTER_TABLE).limit(1).count() > 0:
         print("[load-master] master is not empty; refusing to load again (append-only dataset)")

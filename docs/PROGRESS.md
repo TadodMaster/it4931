@@ -42,7 +42,7 @@ as_of), `bench verify`, `bench kappa-views`, `lk_bench.flinkapi`. Digest definit
 
 Measured (informal, 8 GB VM): replay 5.4k ev/s (first version) → 11.8k ev/s (one state access for scalars, no per-event timers), parallelism 4;
 20 M-event replay was started but abandoned at ~4.4 M after the VM ran out of memory (see "Environment incidents"). Demo-fast profile
-(`LK_PROFILE=fast`, 1 M events) replays in ~90 s and is what phases 3-7 use unless stated.
+(`LK_PROFILE=fast`, 1 M events at that time; later reduced to 100 k events, see Phase 5) was used for the first verifications.
 
 Environment incidents (honest log): (1) SeaweedFS OOM-killed once during the 20 M replay (checkpoints failed, job recovered); (2) Docker engine
 became unresponsive (HTTP 500) until restarted; (3) `.env` variables override profile overlays — HISTORY_EVENTS in `.env` silently produced a 20 M
@@ -60,31 +60,58 @@ batch view = oracle at its own t_k (3 metrics), serving (batch + speed) = oracle
 master distinct ids and id-checksum = oracle, injected duplicates = duplicate rows in master, snapshots append-only, history checksums unchanged.
 Also done: swap atomicity under 6,117 concurrent reads + rollback (`results/final/proof_atomic_swap.json`, PASS).
 
-## Phase 4 - fault injection, chaos, reprocessing, drift - CODE COMPLETE, NOT YET RUN
+## Phase 4 - fault injection, chaos, reprocessing, drift - DONE
 
-Implemented in `python/bench/lk_bench` (`bench run <name>`): `b5` (duplicates + kill TaskManager and Spark archiver, Kappa exactness,
-Lambda speed-layer error and corrective batch), `b6` (rule change v1->v2: Lambda = Spark + Flink + full batch, Kappa = job v2 from offset 0,
-lag curve, oracle check, view switch, zero-downtime pollers), `b7` (drift: Spark v2 only), `determinism` (Kappa replayed twice), `atomic` (done).
-**No B5/B6/B7/determinism result exists yet.** A first determinism attempt on the 1 M dataset was cancelled (checkpoint durations of 7-12 s made the
-replay far slower than the earlier 11.8 k events/s; default checkpoint interval is now 30 s).
+Measured on the final run (`results/final/`, fast profile, 6 GiB VM, see RESULTS.md and the threats section of the report):
+* **B5 duplicates + crash** (5 % duplicates, TaskManager killed, then the Spark archiver): both jobs back in about 30 s, Kappa restored from its S3
+  checkpoint and passed all 15 verification checks with **0 VND difference** (dedup: injected = discarded). The Lambda speed layer lost nothing in this
+  run (0 accounts off); the corrective batch left everything exact. The speed-layer undercount risk is documented but was NOT observed.
+* **B6 rule change v1 -> v2**: Lambda 57.5 s (Spark change + Flink redeploy + full batch over 223 k rows, 2 implementations changed);
+  Kappa 471.7 s replay from offset 0 (226 k events, measured 567 ev/s, predicted T = 398 s), views switched after the oracle check, **0 API failures** on
+  both sides during the switch. The replay rate is low because the VM was starved (an earlier 8 GiB run replayed at 11.8 k ev/s).
+* **B7 drift**: baseline 0 mismatching account-days, after the batch with Spark-only v2 0, after live traffic under the old Flink rule **192**, still 192
+  after Flink was fixed (stale buckets in Redis), 0 after the next batch.
+* **Replay determinism**: the Kappa job run twice from offset 0 gives identical output (metrics and counters). **Atomic swap**: concurrent reader saw only
+  complete versions, rollback works.
 
-## Phase 5 - benchmarks B1-B10 - CODE COMPLETE, NOT YET RUN
+## Phase 5 - benchmarks B1-B10 - DONE (see caveats)
 
-All ten scenarios exist (`b1`..`b10`, repetition via `--repeat`, `scripts/bench_all.sh` runs the whole sequence, about 1 hour on the fast profile).
-No B1-B10 numbers have been produced; therefore `docs/RESULTS.md` still contains no measurements and none are claimed anywhere.
+All ten scenarios ran in one sequence (`bench run-all`, results in `results/final/`, raw CSV/JSON per scenario, `meta.json` with config, git commit,
+image digests, host). Repetitions: B1 and B8 three times; the others once (state-changing scenarios cannot be repeated without a reset).
+Headline numbers are in `docs/RESULTS.md` (generated). Caveats: single laptop, 6 GiB VM, parallelism 1, small data.
 
-## Phase 6 - report, demo UI, Grafana, RUNBOOK, demo-fast - PARTLY DONE
+## Phase 6 - report, demo UI, Grafana, RUNBOOK, demo-fast - DONE
 
-* RUNBOOK rewritten (presenter script included). Demo UI served at `/ui` (HTTP 200 checked; its buttons and the Lambda/Kappa/Truth columns have NOT been exercised in a browser).
-* Report generator `lk_bench/report.py` written (summary table, one chart per scenario, 1920x1080 slides, verification status, threats to validity) but **never executed**: expect small bugs on first run.
-* Prometheus + Grafana (profile `observability`) and the `/metrics` endpoint are written but **never started**.
-* `LK_PROFILE=fast` is now 300 k events, 5 k accounts, 300 tx/s, simulated day = 300 real seconds; `make demo-fast` exists but was not run as one command.
+* `bench report` generates `report.html` (self-contained, light/dark page chrome, table view for every chart), 9 slide PNGs at 1920x1080 and `docs/RESULTS.md`;
+  charts were inspected visually. Colors: validated categorical slots (blue = Lambda, orange = Kappa).
+* Wallet UI `http://localhost:8080/ui` (Lambda | Kappa | Truth, red on mismatch, payment buttons, verification status): endpoints verified from a container
+  (`/sim/now`, `/demo/marker`, `/verify/latest`, all APIs). **Not clicked through in a real browser.**
+* Prometheus (:9090) and Grafana (:3000) start with `make up-observability`; targets up (Flink x2, query-api), dashboard "Lambda vs Kappa" provisioned.
+  Stale consumer groups of cancelled jobs still show their old lag (cosmetic).
+* RUNBOOK covers every command, recovery steps and the 12-minute presenter script. `make demo-fast` = `reset` + `test-e2e` (each part was run by hand).
 
-## Phase 7 - clean-clone final run - NOT DONE
+## Phase 7 - clean-clone final run - PARTLY DONE
 
-`make clean && make reset && make bench-all && make report` has not been run from a clean clone. `make` itself is not installed on this Windows host (Makefile untested; the underlying commands were run by hand).
+Done: `stack.py reset` (wipe + start from the shared Parquet) then `bench run-all` produced everything above from a clean state, and `bench verify` passes for both
+architectures at the end (Kappa 15/15, Lambda 16/16). Several scenarios (B4, B5, verification) had to be rerun after fixing bugs; the final numbers come from
+those reruns on the same stack, not from one uninterrupted sequence. **Not done:** a run from a fresh `git clone` (the repository has no commits of this work;
+`make` is not installed on this host, the Makefile targets were exercised through the equivalent commands).
+
+## Bugs found by the measurements (all fixed, kept here as the honest log)
+
+1. Live generator reused event ids across runs (seeded by seed only) -> duplicates in the truth log.
+2. Kafka log dir and Iceberg catalog were not persistent (defaults in /tmp and memory): an engine restart lost the topic and the table registration.
+3. `docker kill` plus a restart policy does not restart the container: chaos scenarios start it explicitly.
+4. Flink could not restore any S3 checkpoint (S3A change detection vs SeaweedFS ETags) -> `fs.s3a.change.detection.mode: none`.
+5. The nightly batch started exactly at t_k and missed events still in the archiver pipeline (Lambda stuck near 88 % exact): added a grace period.
+6. Oracle queries slowed to minutes by thousands of per-second truth files: compaction added.
+7. ClickHouse out of memory (16 CPUs seen by default settings, big merges): thread, cache and pool limits plus more memory.
+8. Per-version late-events topics were auto-created with 7-day retention while event timestamps are simulated (months old): Kafka deleted late events at once;
+   the topic is now created with infinite retention and the verifier reads all partitions.
+9. Lag measured from committed Kafka offsets is stale by a checkpoint interval; B2/B6 now use processed counts.
+10. Windows line endings written by Python broke `sh` scripts; all text files are LF.
 
 ## State of the machine when work stopped
 
-Stack is UP on the 300 k dataset (Kappa v1 caught up, Lambda batch scheduled). `results/final/` holds only `meta.json` and `proof_atomic_swap.json`.
-A benchmark run was started and stopped at the user's request; its later steps failed only because the bench container was restarted. Run `make reset` before a real benchmark.
+The stack is up on the fast profile (Kappa v2 active, rule v2, Lambda v2, Prometheus and Grafana running); `results/final/` is complete. Run `make reset` before any new benchmark.
+WSL is capped at 6 GiB in `%UserProfile%\.wslconfig` (memory=6GB, swap=4GB, autoMemoryReclaim=gradual). The stray folder `D:\tmp_lkdata` from phase 1 is still there to delete by hand.

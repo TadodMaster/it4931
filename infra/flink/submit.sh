@@ -5,10 +5,10 @@ set -eu
 JOB="${JOB:-kappa}"; RULE="${RULE:-v1}"; JM="${JM:-flink-jobmanager:8081}"
 if [ "$JOB" = "lambda" ]; then
   NAME="lambda-speed"; JAR=/opt/jobs/lambda-flink-speed.jar
-  set -- --rule "$RULE" --parallelism "${PARALLELISM:-2}" --start-from "${START_FROM:-committed}"
+  set -- --rule "$RULE" --parallelism "${PARALLELISM:-1}" --start-from "${START_FROM:-committed}"
 else
   VERSION="${VERSION:-$RULE}"; NAME="kappa-${VERSION}"; JAR=/opt/jobs/kappa-flink-job.jar
-  set -- --rule "$RULE" --version "$VERSION" --parallelism "${PARALLELISM:-2}" --start-from "${START_FROM:-committed}" \
+  set -- --rule "$RULE" --version "$VERSION" --parallelism "${PARALLELISM:-1}" --start-from "${START_FROM:-committed}" \
          --checkpoint-interval-ms "${CHECKPOINT_MS:-30000}"
 fi
 if flink list -r -m "$JM" 2>/dev/null | grep -q " ${NAME} "; then

@@ -96,12 +96,15 @@ def _cmp(truth: dict[str, int], got: dict[str, int], truth2: dict[str, int] | No
     we measure are not errors; a missing late event matches neither)."""
     accts = set(truth) | set(got)
     t2 = truth2 or truth
-    bad = [a for a in accts if got.get(a, 0) not in (truth.get(a, 0), t2.get(a, 0))]
+    # accounts that changed between the two oracle reads have events in flight: they are not judged (both architectures alike)
+    stable = [a for a in accts if truth.get(a, 0) == t2.get(a, 0)]
+    bad = [a for a in stable if got.get(a, 0) != truth.get(a, 0)]
+    accts = stable
     return {"accounts": len(accts), "mismatched": len(bad), "exact_pct": round(100 * (1 - len(bad) / max(1, len(accts))), 3),
             "max_abs_diff": max((abs(truth.get(a, 0) - got.get(a, 0)) for a in bad), default=0)}
 
 
-def b3_correctness_over_time(run_id: str, minutes: float = 12, interval: float = 20, rate: int = 200,
+def b3_correctness_over_time(run_id: str, minutes: float = 10, interval: float = 20, rate: int = 100,
                              start_generator: bool = True, **_) -> dict:
     """Every `interval` s compare ALL accounts (balance) of both architectures with the oracle, at wall-clock now and
     (Lambda) at the batch's own cutoff t_k. Expect a Lambda sawtooth that resets at each nightly batch."""
@@ -156,15 +159,19 @@ def b4_late_pos(run_id: str, in_limit: int = 40, beyond: int = 5, wait_next_batc
     ok_acc, bad_acc = probes[20:35], probes[35:40]
     clk = clock(cfg)
     boundary = clk.sim_now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    from .sc_ops import start_generator as _sg, stop_generator as _stop
+    _sg(f"{run_id}-gen", 100, 1500)            # background traffic: Kappa's watermark only advances while events flow
     wait_real = (boundary - clk.sim_now()).total_seconds() / clk.tc.sim_speedup
     print(f"[b4] waiting {wait_real:.0f} s for the sim-day boundary {boundary.isoformat()} (the nightly batch starts then) ...", flush=True)
-    time.sleep(max(0.0, wait_real))
-    time.sleep(6)                                                   # the scheduler polls every 5 s; the batch snapshot is taken at its start
+    grace_real = cfg["time"].get("batch_grace_sim_minutes", 0) * 60 / clk.tc.sim_speedup
+    time.sleep(max(0.0, wait_real) + grace_real + 14)               # the batch starts at boundary + grace and reads its snapshot in its first seconds
     base_l = {a: lambda_balance_api(a) for a in ok_acc + bad_acc}
     base_k = {a: kappa_balance_api(a) for a in ok_acc + bad_acc}
     now = now_sim(cfg)
     rnd = random.Random(7)
-    exp_ok, exp_bad, last_id = dict(base_l), dict(base_l), ""
+    exp_ok = {a: base_l[a] for a in ok_acc}
+    exp_bad = {a: base_l[a] for a in bad_acc}
+    last_id = ""
     for i in range(in_limit):
         a = ok_acc[i % len(ok_acc)]
         amt = 10_000 + 1000 * i
@@ -200,7 +207,8 @@ def b4_late_pos(run_id: str, in_limit: int = 40, beyond: int = 5, wait_next_batc
     wrong = [x["t_s"] for x in timeline if not x["lambda_exact"]]
     final_exact = next((x["t_s"] for x in reversed(timeline) if not x["lambda_exact"]), None)
     from .verify import _late_event_ids
-    late_ids = _late_event_ids(cfg)
+    from lk_common.ch import current_kappa_version
+    late_ids = _late_event_ids(cfg, current_kappa_version(ch) or "v1")
     kappa_bad_now = {a: kappa_balance_api(a) for a in bad_acc}
     out = {"in_limit_events": in_limit, "beyond_limit_events": beyond, "batch_boundary": boundary.isoformat(),
            "kappa_exact_after_s": None if k_dt is None else round(k_dt, 2),
@@ -213,5 +221,6 @@ def b4_late_pos(run_id: str, in_limit: int = 40, beyond: int = 5, wait_next_batc
            "kappa_late_events_topic_distinct_ids": len(late_ids),
            "note": "beyond-limit events are NOT applied by Kappa (they sit in late-events, never silently dropped); Lambda recomputes "
                    "all history, so it absorbs arbitrarily late events once the next batch has run"}
+    _stop()
     save_json(run_id, "b4_late_pos.json", out)
     return out

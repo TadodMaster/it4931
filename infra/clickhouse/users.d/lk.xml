@@ -1,0 +1,9 @@
+<clickhouse>
+  <profiles>
+    <default>
+      <max_threads>4</max_threads>
+      <max_insert_threads>2</max_insert_threads>
+      <max_block_size>16384</max_block_size>
+    </default>
+  </profiles>
+</clickhouse>

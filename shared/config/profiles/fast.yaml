@@ -6,4 +6,4 @@ data:
   num_accounts: 2000
   history_events: 100000
 generator:
-  live_rate: 200
+  live_rate: 100

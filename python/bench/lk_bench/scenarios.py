@@ -65,3 +65,39 @@ def run(name: str, run_id: str, repeat: int = 1, **kwargs) -> dict:
         print(f"[bench] {name} repetition {i + 1}/{repeat} -> results/{rid}", flush=True)
         outs.append(fn(rid, **kwargs))
     return outs[0] if repeat == 1 else {"repetitions": outs}
+
+
+def run_all(run_id: str) -> dict:
+    """The whole benchmark, in-process (runs inside the bench container, so it survives the caller). Every step is
+    logged and failures do not stop the sequence; a status file is written after each step."""
+    import traceback
+    from .verify import verify_kappa
+    from .verify_lambda import verify_lambda
+    status: dict = {}
+    steps = [("meta", None), ("atomic", {}), ("determinism", {}), ("b1", {"repeat": 3}), ("b8", {"repeat": 3}), ("b2", {}),
+             ("b9", {}), ("b3", {}), ("b4", {}), ("b5", {}), ("batch", {}), ("master-stats", {}), ("verify-kappa", None),
+             ("verify-lambda", None), ("b7", {}), ("b6", {}), ("b10", {}), ("report", None)]
+    for name, kw in steps:
+        t0 = time.time()
+        print(f"\n=== [{time.strftime('%H:%M:%S')}] {name}", flush=True)
+        try:
+            if name == "meta":
+                collect_meta(run_id)
+            elif name == "verify-kappa":
+                ok = verify_kappa("v1", run_id, None, 600).ok
+                status[name] = {"passed": ok}
+            elif name == "verify-lambda":
+                status[name] = {"passed": verify_lambda(run_id, 600).ok}
+            elif name == "report":
+                from .report import build
+                build(run_id)
+            else:
+                run(name, run_id, **(kw or {}))
+            status.setdefault(name, {"ok": True})
+        except BaseException as e:  # noqa: BLE001 - keep going; the status file says what failed
+            traceback.print_exc()
+            status[name] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        status[name]["seconds"] = round(time.time() - t0, 1)
+        save_json(run_id, "bench_all_status.json", status)
+    print("\n=== bench-all finished", flush=True)
+    return status

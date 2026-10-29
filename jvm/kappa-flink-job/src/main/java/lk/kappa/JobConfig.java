@@ -61,7 +61,9 @@ public class JobConfig implements Serializable {
         dedupRetentionMs = Long.parseLong(a.getOrDefault("dedup-retention-ms", String.valueOf(allowedLatenessMs + 30 * 60_000L)));
         topicTransactions = (String) kafkaCfg.get("topic_transactions");
         topicMerchants = (String) kafkaCfg.get("topic_merchants");
-        topicLate = (String) kafkaCfg.get("topic_late_events");
+        // one late-events topic per job version: lateness depends on watermark progress, so a replay can classify differently
+        String lateBase = (String) kafkaCfg.get("topic_late_events");
+        topicLate = "v1".equals(version) ? lateBase : lateBase + "-" + version;
         trace = Boolean.parseBoolean(a.getOrDefault("trace", "true"));
         startFrom = a.getOrDefault("start-from", "committed");
         sinkFlushMs = Long.parseLong(a.getOrDefault("sink-flush-ms", "200"));

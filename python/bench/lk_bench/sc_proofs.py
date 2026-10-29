@@ -18,7 +18,13 @@ def atomic_swap(run_id: str, accounts: int = 60, **_) -> dict:
     version (the old t_k with the old checksum, or the new t_k with the new checksum), never a mix. Then roll back."""
     cfg = load_config()
     ch = ClickHouse()
-    wait_until(lambda: ch.query("SELECT 1 FROM lk.lambda_batch_cur WHERE kind = 'meta' LIMIT 1"), 600, 5)   # first nightly batch
+    def has_meta():
+        try:
+            return ch.query("SELECT 1 FROM lk.lambda_batch_cur WHERE kind = 'meta' LIMIT 1")
+        except Exception:  # noqa: BLE001 - the table appears with the first nightly batch
+            return None
+
+    wait_until(has_meta, 900, 5)                                      # first nightly batch
     accts = [r["account_id"] for r in ch.query(f"SELECT DISTINCT account_id FROM lk.lambda_batch_cur WHERE kind = 'balance' LIMIT {accounts}")]
     in_list = ",".join(f"'{a}'" for a in accts)
     sql = ("SELECT anyIf(k1, kind = 'meta') AS tk, count() AS n, sum(cityHash64(kind, account_id, k1, k2, spend, tx_count)) AS cs "
@@ -70,7 +76,7 @@ def replay_determinism(run_id: str, **_) -> dict:
     ch = ClickHouse()
     assert flinkapi.running_job("kappa-v1"), "kappa-v1 must be running"
     wait_lag_zero("kappa-v1", cfg, 300)
-    flink_submit("kappa", "--rule", "v1", "--version", "v1b", "--parallelism", "2", "--start-from", "earliest",
+    flink_submit("kappa", "--rule", "v1", "--version", "v1b", "--parallelism", "1", "--start-from", "earliest",
                  "--checkpoint-interval-ms", "30000")
     t0 = time.time()
     dt = wait_lag_zero("kappa-v1b", cfg, 1800)

@@ -1,0 +1,8 @@
+<clickhouse>
+  <!-- laptop sizing: small caches, few merge threads (the default sizes everything for the 16 CPUs Docker exposes) -->
+  <mark_cache_size>134217728</mark_cache_size>
+  <uncompressed_cache_size>0</uncompressed_cache_size>
+  <background_pool_size>16</background_pool_size>
+  <background_schedule_pool_size>8</background_schedule_pool_size>
+  <max_concurrent_queries>40</max_concurrent_queries>
+</clickhouse>

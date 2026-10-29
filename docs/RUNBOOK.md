@@ -1,11 +1,11 @@
 # Runbook
 
-Everything below was exercised on the **fast profile** (1 M events, 10 k accounts, 500 tx/s) on an 8 GiB Docker VM.
+Everything below was exercised on the **fast profile** (100 k history events, 2 k accounts, 100 tx/s live, 1 simulated day = 300 real seconds) on a 6 GiB Docker VM (parallelism 1).
 A full presentation takes about 12 minutes (section 8). `make` targets are shown; without GNU make run the command under each.
 
 ## 0. Prerequisites
 
-* Docker Desktop (Compose v2), **8 GiB VM minimum**; Kappa + Lambda + core need about 7.3 GiB at peak. More memory
+* Docker Desktop (Compose v2), **6 GiB VM** is enough for the fast profile with every service limit in `docker-compose.yml`; the full 20 M-event default needs far more. More memory
   (`%UserProfile%\.wslconfig` → `memory=12GB`, then `wsl --shutdown`) makes everything safer.
 * `cp .env.example .env` (`make env`). Tunables live in `shared/config/demo.yaml` and `shared/config/profiles/fast.yaml`;
   `LK_PROFILE=fast` in `.env` selects the small dataset. **A variable set in `.env` overrides the YAML and the profile.**
@@ -125,3 +125,17 @@ http://localhost:8080/ui (account **A010001**, auto refresh on) and Grafana.
 | 10-12 | wrap-up | open `results/final/report.html` | requirement × architecture table, verification green/red, threats to validity |
 
 Fallback: `results/final/slides/*.png` (1920×1080) and the report; every number there is regenerated from raw files by `make report`.
+
+## 9. Operational notes learned the hard way
+
+* **Memory:** the whole stack needs about 6 GiB of Docker memory with parallelism 1 and the fast profile. Set `%UserProfile%\.wslconfig` to
+  `[wsl2] memory=6GB swap=4GB` and `[experimental] autoMemoryReclaim=gradual`, then `wsl --shutdown`. More than about 8 GB for the VM can starve Windows.
+* **Whole benchmark, detached:** `docker exec -d it4931-bench-1 sh -c "python -m lk_bench run-all --run-id final > /app/python/results/final_bench.log 2>&1"`;
+  progress: `docker exec it4931-bench-1 cat /app/python/results/final/bench_all_status.json`. It takes about 70 minutes.
+* **Resume without reloading data:** `python scripts/stack.py resume` starts Flink, the speed layer, the archiver, Kappa and the scheduler (do not use `start`
+  again after the data is loaded: it would load Kafka twice).
+* **Git Bash on Windows rewrites `/opt/...` arguments:** prefix commands with `MSYS_NO_PATHCONV=1` (or use PowerShell) when passing container paths to `docker exec`.
+* **Shell scripts must have LF endings** (`.gitattributes` enforces it for git; Python on Windows writes CRLF unless `newline=""` is used).
+* **After a crash of one container:** `docker kill` does not trigger the restart policy; start it again with `docker start <name>`. Flink recovers from the S3 checkpoint.
+* **Kappa replay of another version:** `bench run b6` (v1 -> v2). Its late events go to `late-events-v2`; `bench verify --arch kappa --rule v2` reads that topic.
+* **Lambda verification needs a quiet system:** run `bench run master-stats` until the master row count equals the Kafka end offsets, then `bench run batch`, then verify.

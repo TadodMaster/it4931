@@ -127,7 +127,7 @@ def verify_kappa(rule: str = "v1", run_id: str = "local", cutoff: str | None = N
     compact_truth(paths["truth_live"])
     oracle = Oracle([paths["truth_backfill"], paths["truth_live"]], paths["merchants_csv"])
     late_n = int(ch.scalar("SELECT sum(late) FROM lk.kappa_current_account") or 0)
-    late_ids = _late_event_ids(cfg) if late_n > 0 else set()
+    late_ids = _late_event_ids(cfg, version) if late_n > 0 else set()
     oracle.exclude(late_ids)               # events beyond the lateness limit are in late-events, deliberately not applied
 
     # 1. oracle equality (exact integer equality of every row of every metric)
@@ -172,8 +172,9 @@ def verify_kappa(rule: str = "v1", run_id: str = "local", cutoff: str | None = N
     rep.add("every stream event is accepted, discarded as duplicate or in late-events",
             int(kb["acc"]) + int(kb["dup"]) + int(kb["late"]) == total_stream,
             accepted=int(kb["acc"]), duplicates=int(kb["dup"]), late=int(kb["late"]), stream_total=total_stream)
-    rep.add("late data: injected beyond-limit events all landed in late-events (none disappeared)",
-            inj["beyond_limit"] == len(late_ids), injected=inj["beyond_limit"], late_events_distinct=len(late_ids),
+    rep.add("late data: every event routed to late-events is counted exactly once (none disappeared)",
+            len(late_ids) == int(kb["late"]), late_events_distinct=len(late_ids), late_counter=int(kb["late"]),
+            injected_beyond_limit=inj["beyond_limit"],
             injected_late_pos_within_limit=inj["late_pos"], note="within-limit late POS are covered by oracle equality")
 
     out = Path("results") / run_id
@@ -199,15 +200,28 @@ def _drill_down(oracle: Oracle, ch: ClickHouse, metric: str, rule: str, cutoff: 
     return {"mismatched_accounts": len(bad), "sample": sample, "detail": detail}
 
 
-def _late_event_ids(cfg: dict) -> set[str]:
+def late_topic(cfg: dict, version: str) -> str:
+    base = cfg["kafka"]["topic_late_events"]
+    return base if version == "v1" else f"{base}-{version}"
+
+
+def _late_event_ids(cfg: dict, version: str = "v1") -> set[str]:
     c = Consumer({"bootstrap.servers": cfg["kafka"]["bootstrap"], "group.id": f"verify-late-{time.time_ns()}",
                   "auto.offset.reset": "earliest", "enable.auto.commit": False})
-    topic = cfg["kafka"]["topic_late_events"]
+    topic = late_topic(cfg, version)
     try:
-        lo, hi = c.get_watermark_offsets(TopicPartition(topic, 0), timeout=10)
-        c.assign([TopicPartition(topic, 0, lo)])
+        try:
+            parts = list(c.list_topics(topic, timeout=10).topics[topic].partitions)   # the topic may have been auto-created with 6
+        except Exception:  # noqa: BLE001 - topic does not exist: nothing was routed to it
+            return set()
+        tps, expected = [], 0
+        for p in parts:
+            lo, hi = c.get_watermark_offsets(TopicPartition(topic, p), timeout=10)
+            tps.append(TopicPartition(topic, p, lo))
+            expected += hi - lo
+        c.assign(tps)
         ids, seen = set(), 0
-        while seen < hi - lo:
+        while seen < expected:
             m = c.poll(5)
             if m is None:
                 break

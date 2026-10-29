@@ -32,6 +32,7 @@ public class KappaJob {
         System.out.printf("[kappa] version=%s rule=%s group=%s allowedLatenessMs=%d oooMs=%d dedupRetentionMs=%d start=%s%n",
             cfg.version, cfg.rule, cfg.group, cfg.allowedLatenessMs, cfg.oooMs, cfg.dedupRetentionMs, cfg.startFrom);
         ClickHouse.createTables(cfg);
+        ensureLateTopic(cfg);
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(cfg.parallelism);
@@ -81,5 +82,23 @@ public class KappaJob {
         upserts.getSideOutput(AccountFn.LATE).sinkTo(lateSink).uid("sink-late").name("late-events");
 
         env.execute("kappa-" + cfg.version);
+    }
+
+    /**
+     * The per-version late-events topic must keep its data forever: event timestamps are simulated (months older than the wall clock),
+     * so Kafka's default 7-day time retention would delete late events as soon as they are written.
+     */
+    private static void ensureLateTopic(JobConfig cfg) throws Exception {
+        java.util.Properties p = new java.util.Properties();
+        p.put("bootstrap.servers", cfg.kafka);
+        try (org.apache.kafka.clients.admin.AdminClient admin = org.apache.kafka.clients.admin.AdminClient.create(p)) {
+            org.apache.kafka.clients.admin.NewTopic t = new org.apache.kafka.clients.admin.NewTopic(cfg.topicLate, 1, (short) 1)
+                .configs(java.util.Map.of("retention.ms", "-1"));
+            try {
+                admin.createTopics(java.util.List.of(t)).all().get();
+            } catch (java.util.concurrent.ExecutionException e) {
+                if (!(e.getCause() instanceof org.apache.kafka.common.errors.TopicExistsException)) throw e;
+            }
+        }
     }
 }

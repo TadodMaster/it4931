@@ -68,9 +68,21 @@ def now_sim(cfg: dict) -> datetime:
 
 # ---- readers -----------------------------------------------------------------------------------------------------
 def api_get(path: str, **params) -> dict:
-    r = _http.get(API + path, params=params)
-    r.raise_for_status()
-    return r.json()
+    """GET with a few retries: a 5xx while ClickHouse is busy merging is retried like any real client would (counted in API_RETRIES)."""
+    last = None
+    for attempt in range(4):
+        r = _http.get(API + path, params=params)
+        if r.status_code < 500:
+            r.raise_for_status()
+            return r.json()
+        last = r
+        API_RETRIES.append((path, r.status_code))
+        time.sleep(0.5 * (attempt + 1))
+    last.raise_for_status()
+    return last.json()
+
+
+API_RETRIES: list[tuple[str, int]] = []
 
 
 def kappa_balance_api(a: str) -> int:
@@ -148,12 +160,39 @@ def backfill_total(cfg: dict) -> int:
     return int(json.loads(p.read_text())["sent"])
 
 
-def processed_lag(group: str, cfg: dict, ch: ClickHouse) -> int | None:
-    """Messages still to be processed by `group` (kappa-<ver> or lambda-speed); None if that architecture is not running."""
-    end = kafka_end_total(cfg)
+def processed_count(group: str, ch: ClickHouse) -> int | None:
     if group.startswith("kappa-"):
-        n = kappa_processed(ch, group.split("-", 1)[1])
-        return None if n is None else max(0, end - n)
+        return kappa_processed(ch, group.split("-", 1)[1])
     if group == "lambda-speed":
-        return max(0, end - backfill_total(cfg) - speed_processed())   # speed layer starts at the end of the backfill
-    return lag_total(group, cfg)
+        return speed_processed()
+    return None
+
+
+def settle(group: str, cfg: dict, ch: ClickHouse, quiet_s: float = 6.0, timeout: float = 300.0) -> tuple[int, int] | None:
+    """Wait until `group` stops making progress (processed count and Kafka end offsets both stable) and return (end, processed).
+    Used as the baseline for lag: lag(t) = (end(t) - end0) - (processed(t) - processed0)."""
+    t0, last, since = time.time(), None, time.time()
+    while time.time() - t0 < timeout:
+        cur = (kafka_end_total(cfg), processed_count(group, ch))
+        if cur[1] is None:
+            return None
+        if cur != last:
+            last, since = cur, time.time()
+        elif time.time() - since >= quiet_s:
+            return cur
+        time.sleep(1)
+    return last
+
+
+def processed_lag(group: str, cfg: dict, ch: ClickHouse, base: tuple[int, int] | None = None) -> int | None:
+    """Messages still to be processed by `group` (kappa-<ver> or lambda-speed); None if that architecture is not running.
+    Without a baseline the Kappa job is compared with the whole topic; the speed layer needs a settled baseline."""
+    end = kafka_end_total(cfg)
+    n = processed_count(group, ch)
+    if n is None:
+        return lag_total(group, cfg) if not group.startswith(("kappa-", "lambda")) else None
+    if base is not None:
+        return max(0, (end - base[0]) - (n - base[1]))
+    if group.startswith("kappa-"):
+        return max(0, end - n)
+    return max(0, end - backfill_total(cfg) - n)

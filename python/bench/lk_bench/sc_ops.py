@@ -86,9 +86,14 @@ def flink_cancel(name_suffix: str) -> bool:
 
 
 def wait_lag_zero(group: str, cfg: dict, timeout: float = 900, sample: list | None = None, every: float = 2.0) -> float | None:
-    """Wait until `group` has processed everything in Kafka (processed-count based; see common.processed_lag)."""
+    """Wait until `group` has processed everything in Kafka. Kappa: processed == topic size. Speed layer (stateless counters):
+    processed count and Kafka end offsets stable for 6 s."""
+    from .common import settle
     t0 = time.time()
     ch = ClickHouse()
+    if group == "lambda-speed":
+        r = settle(group, cfg, ch, 6.0, timeout)
+        return None if r is None else time.time() - t0
     while time.time() - t0 < timeout:
         lag = processed_lag(group, cfg, ch)
         if sample is not None and lag is not None:
@@ -147,7 +152,7 @@ def oracle_digests(oracle: Oracle, rule: str) -> dict:
 
 
 # ======================================================================================================= B2
-def b2_throughput(run_id: str, rates: str = "200,400,800,1600,2400", step_s: int = 25, **_) -> dict:
+def b2_throughput(run_id: str, rates: str = "100,200,400,800,1200", step_s: int = 20, **_) -> dict:
     """Step the ingest rate; a step is sustained if every running architecture's consumer lag stays bounded."""
     cfg = load_config()
     rate_list = [int(x) for x in rates.split(",")]
@@ -156,15 +161,18 @@ def b2_throughput(run_id: str, rates: str = "200,400,800,1600,2400", step_s: int
     chq = ClickHouse()
     groups = {g: processed_lag(g, cfg, chq) is not None for g in ("kappa-v1", "lambda-speed")}
     active = [g for g, ok in groups.items() if ok]
-    for g in active:                                    # start from an idle system
+    base = {}
+    for g in active:                                    # start from an idle system; lag is measured against this baseline
         wait_lag_zero(g, cfg, 300)
+        from .common import settle
+        base[g] = settle(g, cfg, chq, 6.0, 120)
     rid = f"{run_id}-gen"
     start_generator(rid, rate_list[0], total, ramp=ramp)
     samples, t0 = [], time.time()
     while time.time() - t0 < total + 5:
         row = {"t_s": round(time.time() - t0, 1)}
         for g in active:
-            row[f"lag_{g}"] = processed_lag(g, cfg, chq)
+            row[f"lag_{g}"] = processed_lag(g, cfg, chq, base[g])
         st = dockerctl.stats()
         for svc in ("flink-taskmanager", "spark-archiver", "redis", "clickhouse", "kafka"):
             if svc in st:
@@ -194,10 +202,13 @@ def b2_throughput(run_id: str, rates: str = "200,400,800,1600,2400", step_s: int
 
 
 # ======================================================================================================= B5
-def b5_duplicates_crash(run_id: str, seconds: int = 90, rate: int = 200, dup_ratio: float = 0.05, **_) -> dict:
+def b5_duplicates_crash(run_id: str, seconds: int = 60, rate: int = 100, dup_ratio: float = 0.05, **_) -> dict:
     cfg = load_config()
     ch = ClickHouse()
-    out: dict = {"duplicate_ratio": dup_ratio}
+    from lk_common.ch import current_kappa_version
+    ver = current_kappa_version(ch) or "v1"                                  # the active Kappa job version and rule (v1 on a fresh stack)
+    rule = redis.Redis(host="redis", decode_responses=True).get("lambda:spark_rule") or "v1"
+    out: dict = {"duplicate_ratio": dup_ratio, "kappa_version": ver, "rule": rule}
     start_generator(f"{run_id}-gen", rate, seconds, "--duplicate-ratio", str(dup_ratio))
     t0 = time.time()
     time.sleep(30)
@@ -211,18 +222,17 @@ def b5_duplicates_crash(run_id: str, seconds: int = 90, rate: int = 200, dup_rat
     dockerctl.start("spark-archiver")
     wait_until(lambda: dockerctl.status("flink-taskmanager") == "running", 120, 2)
     wait_until(lambda: dockerctl.status("spark-archiver") == "running", 120, 2)
-    wait_until(lambda: flinkapi.running_job("kappa-v1") is not None and flinkapi.running_job("lambda-speed") is not None, 240, 2)
+    wait_until(lambda: flinkapi.running_job(f"kappa-{ver}") is not None and flinkapi.running_job("lambda-speed") is not None, 240, 2)
     out["jobs_back_at_s"] = round(time.time() - t0, 1)
     time.sleep(max(0, seconds + 10 - (time.time() - t0)))             # generator finishes
-    out["kappa_catchup_s"] = wait_lag_zero("kappa-v1", cfg, 600)
+    out["kappa_catchup_s"] = wait_lag_zero(f"kappa-{ver}", cfg, 600)
     out["lambda_speed_catchup_s"] = wait_lag_zero("lambda-speed", cfg, 600)
     # Kappa: exact, 0 VND difference, no double counting
-    rep = verify_kappa("v1", f"{run_id}-kappa", None, 300)
+    rep = verify_kappa(rule, f"{run_id}-kappa", None, 300)
     out["kappa_verification_passed"] = rep.ok
     out["kappa_failed_checks"] = [c["name"] for c in rep.checks if c["status"] == "fail"]
     # Lambda speed layer: report honestly what the crash did, then show the next batch correcting it
     oracle = oracle_for(cfg)
-    rule = "v1"
     before = serving_matches_oracle(ch, oracle, rule)
     out["lambda_serving_before_batch"] = {m: {"ok": r["ok"], "oracle_rows": r["oracle"]["rows"], "serving_rows": r["serving"]["rows"]}
                                           for m, r in before.items()}
@@ -262,7 +272,7 @@ def b6_rule_change(run_id: str, live_rate: int = 0, **_) -> dict:
     r.set("lambda:spark_rule", "v2")                                    # (1) Spark implementation deployed
     t_spark = time.time() - t0
     flink_cancel("lambda-speed")                                        # (2) Flink (Java) implementation deployed
-    flink_submit("lambda", "--rule", "v2", "--parallelism", "2", "--start-from", "committed")
+    flink_submit("lambda", "--rule", "v2", "--parallelism", "1", "--start-from", "committed")
     wait_until(lambda: flinkapi.running_job("lambda-speed") is not None, 120, 1)
     t_flink = time.time() - t0
     wait_lag_zero("lambda-speed", cfg, 300)
@@ -281,7 +291,7 @@ def b6_rule_change(run_id: str, live_rate: int = 0, **_) -> dict:
     r_in = live_rate
     lag_curve: list[dict] = []
     t0 = time.time()
-    flink_submit("kappa", "--rule", "v2", "--version", "v2", "--parallelism", "2", "--start-from", "earliest",
+    flink_submit("kappa", "--rule", "v2", "--version", "v2", "--parallelism", "1", "--start-from", "earliest",
                  "--checkpoint-interval-ms", "30000")
     t_started = time.time() - t0
     catch = wait_lag_zero("kappa-v2", cfg, 1800, lag_curve, 2.0)
@@ -311,7 +321,7 @@ def b6_rule_change(run_id: str, live_rate: int = 0, **_) -> dict:
 
 
 # ======================================================================================================= B7
-def b7_drift(run_id: str, live_seconds: int = 40, rate: int = 200, **_) -> dict:
+def b7_drift(run_id: str, live_seconds: int = 40, rate: int = 100, **_) -> dict:
     """Deploy the new rule to Spark only. After a batch the report follows v2, but everything the speed layer (Flink, still v1)
     computed since then disagrees with it; fixing Flink does not repair the stale buckets until the next batch replaces them."""
     cfg = load_config()
@@ -339,7 +349,7 @@ def b7_drift(run_id: str, live_seconds: int = 40, rate: int = 200, **_) -> dict:
     wait_lag_zero("lambda-speed", cfg, 120)
     out["spark_v2_flink_v1"] = {**mismatches("v2"), "elapsed_s": round(time.time() - t0, 1)}
     flink_cancel("lambda-speed")                                           # now fix Flink ...
-    flink_submit("lambda", "--rule", "v2", "--parallelism", "2", "--start-from", "committed")
+    flink_submit("lambda", "--rule", "v2", "--parallelism", "1", "--start-from", "committed")
     wait_until(lambda: flinkapi.running_job("lambda-speed") is not None, 120, 1)
     wait_lag_zero("lambda-speed", cfg, 120)
     out["flink_fixed_before_next_batch"] = {**mismatches("v2"), "elapsed_s": round(time.time() - t0, 1),
@@ -406,7 +416,7 @@ def master_stats(run_id: str, **_) -> dict:
 
 
 # ======================================================================================================= e2e
-def e2e(run_id: str, seconds: int = 45, rate: int = 200, **_) -> dict:
+def e2e(run_id: str, seconds: int = 40, rate: int = 100, **_) -> dict:
     """make test-e2e: live traffic with duplicates and late POS, quiesce, corrective batch, then `bench verify` for both."""
     from .verify import _end_offsets
     from .verify_lambda import verify_lambda

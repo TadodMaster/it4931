@@ -21,7 +21,8 @@ PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", ROOT.name.lower().replace("-", 
 
 
 def sh(*args: str, check: bool = True, env: dict | None = None, quiet: bool = False) -> str:
-    r = subprocess.run(list(args), cwd=ROOT, capture_output=True, text=True, env={**os.environ, **(env or {})})
+    r = subprocess.run(list(args), cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env={**os.environ, **(env or {})})
     if check and r.returncode != 0:
         sys.exit(f"FAILED: {' '.join(args)}\n{r.stdout[-800:]}\n{r.stderr[-800:]}")
     if not quiet:
@@ -90,12 +91,24 @@ def start(profile_fast: bool = True) -> None:
         gen("python", "-m", "lk_generator", "merchants")
         gen("python", "-m", "lk_generator", "backfill", "--run-id", "seed")
     gen("python", "-m", "lk_generator", "load-kafka")                       # Kappa source
+    dc("build", "spark-load-master")                                        # Spark image (shared by archiver, batch, scheduler)
     dc("run", "--rm", "spark-load-master")                                  # Lambda master, from the SAME Parquet files
-    dc("up", "-d", "--wait", "flink-jobmanager", "flink-taskmanager")
+    run_jobs()
+
+
+def run_jobs() -> None:
+    """Everything after the data is loaded (also usable alone as `resume`)."""
+    dc("up", "-d", "--build", "--wait", "flink-jobmanager", "flink-taskmanager")
     dc("up", "lambda-init")
     dc("up", "lambda-speed-submit", env={"LAMBDA_START_FROM": "latest"})
     dc("up", "-d", "spark-archiver")
-    dc("up", "kappa-submit", env={"KAPPA_START_FROM": "earliest", "KAPPA_PARALLELISM": "2"})
+    dc("up", "kappa-submit", env={"KAPPA_START_FROM": "earliest", "KAPPA_PARALLELISM": "1"})
+    def tables_ready() -> bool:                                             # the job creates its tables when it starts
+        out = sh("docker", "exec", f"{PROJECT}-clickhouse-1", "clickhouse-client", "-q",
+                 "SELECT count() FROM system.tables WHERE database='lk' AND name='kappa_v1_account'", quiet=True)
+        return out.strip() == "1"
+
+    wait_for(tables_ready, "kappa_v1 tables", 300, 3)
     dc("exec", "-T", "bench", "python", "-m", "lk_bench", "kappa-views", "--to", "v1")
     print("== waiting for Kappa replay ...", flush=True)
 
@@ -115,13 +128,15 @@ def status() -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["wipe", "start", "status", "reset"])
+    ap.add_argument("cmd", choices=["wipe", "start", "status", "reset", "resume"])
     ap.add_argument("--regen", action="store_true", help="also delete and regenerate the backfill Parquet")
     a = ap.parse_args()
     if a.cmd == "wipe":
         wipe(a.regen)
     elif a.cmd == "start":
         start()
+    elif a.cmd == "resume":
+        run_jobs()
     elif a.cmd == "reset":
         wipe(a.regen)
         start()

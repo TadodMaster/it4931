@@ -57,12 +57,12 @@ def create_master_table(spark: SparkSession) -> None:
 
 
 def insert_partition(table: str, base: str, rows) -> None:
-    """foreachPartition body: batches of 20k JSON lines."""
+    """foreachPartition body: batches of 5k JSON lines."""
     ch = ClickHouse(base)
     buf: list[str] = []
     for r in rows:
         buf.append(r)
-        if len(buf) >= 20_000:
+        if len(buf) >= 5_000:
             ch.insert_json_rows(table, buf)
             buf = []
     if buf:

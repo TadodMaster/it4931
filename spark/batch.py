@@ -55,7 +55,7 @@ def run(t_k: datetime, rule: str, run_id: str, trace: bool = True, purge_current
     ch = ClickHouse(base)
     ensure_serving_tables(ch)
     started = time.time()
-    spark = spark_session("lk-batch", shuffle_partitions=8, driver_mem="1g")
+    spark = spark_session("lk-batch", shuffle_partitions=8, driver_mem="768m")
     snap = spark.sql(f"SELECT snapshot_id FROM {MASTER_TABLE}.snapshots ORDER BY committed_at DESC LIMIT 1").collect()[0][0]
     tk_lit = F.lit(t_k.strftime("%Y-%m-%d %H:%M:%S")).cast("timestamp")
     ev = (spark.read.format("iceberg").option("snapshot-id", str(snap)).load(MASTER_TABLE)

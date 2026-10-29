@@ -8,6 +8,7 @@ time:
   history_start: "2023-01-01"   # inclusive, UTC
   history_years: 3              # history_end = start + 3y (exclusive); live clock starts there
   batch_period_sim_hours: 24    # Lambda nightly batch period P
+  batch_grace_sim_minutes: 120  # the batch for t_k starts at t_k + grace so the master (archiver) and late POS events have settled
   pos_max_lateness_sim_hours: 2 # offline POS sync limit (Y4)
   allowed_lateness_margin_sim_minutes: 10
   watermark_out_of_orderness_sim_seconds: 60

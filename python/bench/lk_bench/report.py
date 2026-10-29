@@ -74,7 +74,11 @@ def spread(vals: list[float]) -> str:
 
 
 def f(x, nd=2):
-    return "n/a" if x is None else (f"{x:,.{nd}f}".rstrip("0").rstrip(".") if isinstance(x, float) else f"{x:,}")
+    if x is None:
+        return "n/a"
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return str(x)                      # lists, dicts, strings: shown as they are
+    return f"{x:,.{nd}f}".rstrip("0").rstrip(".") if isinstance(x, float) else f"{x:,}"
 
 
 # ------------------------------------------------------------------------------------------------ charts
@@ -321,12 +325,15 @@ def summary_table(b1, b2, b3, b4, b5, b6, b7, b8, b9) -> list[list[str]]:
     if b4:
         a = b4[0]
         add("Y4 exact money", "late POS (<= 2 h): time until exact (s)", f(a["lambda_exact_after_s"], 1), f(a["kappa_exact_after_s"], 2), lower(a["lambda_exact_after_s"], a["kappa_exact_after_s"]))
-        add("Y4 exact money", "events later than the limit", f"absorbed at next batch ({f(a['lambda_beyond_limit_exact_after_s'], 1)} s)",
-            f"{a['kappa_late_events_topic_distinct_ids']} counted in late-events, not applied", "Lambda recomputes everything; Kappa surfaces them")
+        add("Y4 exact money", "events later than the limit", f"absorbed at the next batch (exact: {a.get('lambda_beyond_limit_final_exact')})",
+            f"{a['kappa_late_events_topic_distinct_ids']} in late-events, not applied", "Lambda recomputes everything; Kappa surfaces them")
     if b5:
         add("Y4 exact money", "after duplicates + crash (TaskManager and archiver killed)",
             f"{b5['lambda_balance_mismatched_accounts']} accounts off by {f(b5['lambda_balance_total_error_vnd'], 0)} VND until the next batch",
-            "exact (0 VND)" if b5["kappa_verification_passed"] else "NOT exact: " + ", ".join(b5["kappa_failed_checks"][:2]), "Kappa" if b5["kappa_verification_passed"] else "see report")
+            "exact (0 VND)" if b5["kappa_verification_passed"] else "NOT exact: " + ", ".join(b5["kappa_failed_checks"][:2]),
+            ("tie: both exact in this run (the speed layer can lose events in a crash window; the next batch repairs them)"
+             if b5["kappa_verification_passed"] and b5["lambda_balance_mismatched_accounts"] == 0
+             else "Kappa" if b5["kappa_verification_passed"] else "see report"))
     if b3:
         add("Y1/Y4 correctness", "lowest share of exactly-correct accounts over the run (%)", f(b3["lambda_min_exact_pct"], 3), f(b3["kappa_min_exact_pct"], 3),
             "Kappa" if b3["kappa_min_exact_pct"] > b3["lambda_min_exact_pct"] else "tie" if b3["kappa_min_exact_pct"] == b3["lambda_min_exact_pct"] else "Lambda")
@@ -380,14 +387,16 @@ def render_html(run_id, meta, summary, ver_html, charts, imgs, b10) -> str:
         tbl = "<table><tr>" + "".join(f"<th>{esc(h)}</th>" for h in header) + "</tr>" + "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in r) + "</tr>" for r in rows) + "</table>"
         secs += f"<section><h2>{esc(title)}</h2><img alt='{esc(title)}' src='data:image/png;base64,{imgs[slug]}'><details><summary>table view</summary>{tbl}</details></section>"
     threats = """<section><h2>Threats to validity</h2><ul>
-<li><b>Scale:</b> the demo dataset is ~1 M events (profile <code>fast</code>), not 10 billion; B10 extrapolates linearly from measured rates and is an order of magnitude illustration only.</li>
-<li><b>One laptop, one Kafka broker, 8 GiB Docker VM:</b> services compete for CPU and memory; Spark runs in local mode; Flink has 6 slots in one TaskManager. Absolute numbers are not production numbers; ratios and failure behaviour are what this run shows.</li>
-<li><b>Simulated time</b> (144x): a "night" lasts 10 real minutes; real network, disk and GC effects do not scale with it. The 2-hour POS limit is 50 real seconds.</li>
-<li><b>Object store:</b> SeaweedFS replaces MinIO (no pullable official image); Hadoop S3A did not work against it, so the Spark streaming checkpoint is on a local volume.</li>
-<li><b>Single generator process</b> bounds the ingest rate in B2; when both architectures show the same maximum, the generator, not the architecture, is the limit.</li>
-<li><b>Lambda speed layer:</b> Redis dedup (SET NX) is not transactional with the increments; the order chosen undercounts after a crash instead of double counting, and the next batch corrects it.</li>
-<li><b>Repetitions:</b> timing scenarios are reported as median (spread) when repeated; scenarios that reset state (B5-B7) were run once unless stated.</li>
-<li><b>Image versions:</b> see meta.json (digests) of this run; Kafka 3.9.1, Flink 1.20.2, Spark 3.5.6, Iceberg 1.10.0, ClickHouse 25.8, Redis 7.4.5, SeaweedFS 3.97.</li></ul></section>"""
+<li><b>Scale:</b> 100 k history events plus about 350 k live events per full run (profile <code>fast</code>), not 10 billion. B10 extrapolates linearly from measured rates and is an order-of-magnitude illustration only.</li>
+<li><b>Resource-starved machine:</b> everything ran in a 6 GiB Docker VM on a laptop (Kafka, S3, Iceberg, ClickHouse, Redis, Spark in local mode, one Flink TaskManager, all jobs at parallelism 1). The VM showed I/O stalls and swap. An earlier informal run on an 8 GiB VM with 4 slots replayed Kappa at about 11.8 k events/s; this run's replay rate (a few hundred events/s) is a property of the squeezed environment, not of the architecture. Ratios and failure behaviour are what this report shows, not absolute speeds.</li>
+<li><b>Simulated time</b> (288x): a simulated "night" lasts 5 real minutes, the 2-hour POS limit 25 real seconds and the batch grace period (2 simulated hours) 25 real seconds. Real network, disk and GC effects do not scale with it.</li>
+<li><b>Kappa lateness depends on the watermark:</b> an event is "late" relative to the watermark of the partitions, which depends on processing progress. A replay (another job version) can therefore classify a borderline event differently from the live job. Each job version has its own <code>late-events</code> topic and the verifier excludes exactly those events. Without background traffic the watermark does not advance and nothing is classified late.</li>
+<li><b>Lambda batch needs a grace period:</b> a batch started exactly at t_k misses events still in the archiver pipeline and late POS events; the scheduler waits 2 simulated hours. This is the freshness-for-completeness trade-off of the batch layer.</li>
+<li><b>Single generator process</b> bounds the ingest rate in B2; if the generator, not the architecture, saturates, both architectures show the same maximum.</li>
+<li><b>Lambda speed layer:</b> Redis dedup (SET NX) is not transactional with the increments; the order chosen undercounts after a crash instead of double counting, and the next batch repairs it. In the B5 run no event was lost, so no error was observed; absence of an observed error is not proof it cannot happen.</li>
+<li><b>Repetitions:</b> B1 and B8 were run 3 times (median and spread in the tables); B2-B7 once each. Scenarios that change state (B5-B7) ran in a fixed order on one stack.</li>
+<li><b>Object store:</b> SeaweedFS replaces MinIO (no pullable official image). Hadoop S3A needed change detection switched off for Flink checkpoint restore; the Spark streaming checkpoint lives on a local volume.</li>
+<li><b>Image versions:</b> see meta.json (digests) of this run: Kafka 3.9.1, Flink 1.20.2, Spark 3.5.6, Iceberg 1.10.0, ClickHouse 25.8, Redis 7.4.5, SeaweedFS 3.97.</li></ul></section>"""
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>Lambda vs Kappa Report</title><style>{CSS}</style></head><body><main><h1>Lambda vs Kappa: results</h1>{env}"
             f"<section><h2>Summary: requirements Y1-Y4</h2>{sums}</section><section><h2>Verification (automated, exact integer equality with the oracle)</h2>{ver_html}</section>"
