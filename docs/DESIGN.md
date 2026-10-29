@@ -1,7 +1,7 @@
 # Design — Lambda vs Kappa live demo & benchmark
 
 One business problem (e-wallet customer spending statistics, requirements Y1–Y4) implemented twice on
-**byte-identical input**, then measured. Source of requirements: `claude_code_prompt_lambda_kappa_demo.md`.
+**byte-identical input**, then measured. Source of requirements: `docs/claude_code_prompt_lambda_kappa_demo.md`.
 
 ## 1. Architecture at a glance
 
